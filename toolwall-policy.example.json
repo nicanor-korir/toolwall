@@ -12,6 +12,11 @@
     }
   },
 
+  "confirmation": {
+    "maxPrompts": 5,
+    "timeoutMs": 120000
+  },
+
   "servers": {
     "filesystem": {
       "defaults": {
@@ -55,16 +60,33 @@
     },
 
     "fetch": {
-      "defaults": {
-        "network": {
-          "hosts": ["api.github.com", "*.githubusercontent.com", "127.0.0.1"],
-          "schemes": ["https"],
-          "allowPrivateNetwork": false,
-          "allowIpLiterals": false
-        }
+      "egress": {
+        "enforce": "roles",
+        "hosts": ["api.github.com", "*.githubusercontent.com", "127.0.0.1"],
+        "schemes": ["https"],
+        "allowPrivateNetwork": false,
+        "allowIpLiterals": false,
+        "onViolation": "block"
+      },
+      "response": {
+        "outputSchema": "record",
+        "atpa": "enforce",
+        "inputRequests": "enforce",
+        "elicitation": "enforce"
       },
       "tools": {
         "fetch": { "mutates": false }
+      }
+    },
+
+    "database": {
+      "egress": {
+        "enforce": "roles",
+        "hosts": ["db.internal.example.com", "127.0.0.1"],
+        "schemes": ["postgres", "postgresql"]
+      },
+      "tools": {
+        "connect": { "roles": { "host": ["/host"] }, "mutates": false }
       }
     },
 

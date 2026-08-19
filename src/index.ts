@@ -61,6 +61,7 @@ import type { ToolDefinition, ToolDefinitionSource } from './policy/contract.js'
 import { defaultPolicy, type ResolvedPolicy } from './policy/parse.js';
 import { DefaultGuardPipeline } from './transport/pipeline.js';
 import { ToolwallProxy, type ProxyEvent } from './transport/proxy.js';
+import type { ReconnectPolicy } from './transport/reconnect.js';
 import {
     createUpstreamStdioTransport,
     type SpawnAudit,
@@ -149,6 +150,27 @@ export interface ToolwallOptions {
     readonly onPinEvent?: (event: PinEvent) => void;
     readonly enable?: GuardToggles;
     readonly upstreamRequestTimeoutMs?: number;
+    /**
+     * Zero-downtime reconnection. **Enabled by default** — this is the week-2
+     * reliability deliverable, and a security proxy that takes the editor
+     * session down whenever the server it is watching bounces gets uninstalled.
+     *
+     * Pass `{ enabled: false }` for the week-1 behaviour (upstream close tears
+     * the client leg down immediately). See `src/transport/reconnect.ts` for the
+     * retry schedule, the buffer bound and the replay semantics, and
+     * `ToolwallProxy.#reverifyAfterReconnect` for why a reconnect cannot be a
+     * path around a guard.
+     */
+    readonly reconnect?: Partial<ReconnectPolicy>;
+    /**
+     * Called with each upstream transport as it is created, including the
+     * replacements a reconnect builds.
+     *
+     * A reconnect spawns a **new child process with a new stderr pipe**, so a
+     * caller that attached a stderr relay to the first transport would go
+     * quiet after the first restart. This is how it re-attaches.
+     */
+    readonly onUpstreamTransport?: (transport: StdioClientTransport) => void;
 }
 
 export interface Toolwall {
@@ -166,8 +188,13 @@ export interface Toolwall {
      * The upstream transport, exposed for two things only: reading `pid` after `start()`, and
      * relaying the child's `stderr`. It is piped rather than inherited so the child can never
      * write to OUR stdout, which under stdio transport is the protocol channel.
+     *
+     * This is the transport for the FIRST upstream process. A reconnect builds a new one; use
+     * `onUpstreamTransport` to follow it, or `currentUpstreamTransport` to read the live one.
      */
     readonly upstreamTransport: StdioClientTransport;
+    /** The upstream transport currently in use, which a reconnect replaces. */
+    readonly currentUpstreamTransport: StdioClientTransport;
     /** Names of the guards actually registered, for a startup banner that does not lie. */
     readonly registeredGuards: readonly string[];
     start(): Promise<void>;
@@ -284,9 +311,42 @@ export function assembleToolwall(options: ToolwallOptions): Toolwall {
         registeredGuards.push(capabilityGuard.name);
     }
 
+    options.onUpstreamTransport?.(upstream.transport);
+    let currentUpstream = upstream.transport;
+
+    /**
+     * Respawn for a reconnection attempt.
+     *
+     * `createUpstreamStdioTransport` re-runs `validateSpawnSpec` every time, so the T-07
+     * argument-level controls are enforced on the replacement process too and not only on the
+     * first one. Every restart is also recorded, which is the spec's "log all stdio transport
+     * usage" obligation applied to the case where the process count is not one.
+     */
+    const createUpstreamTransport = (): StdioClientTransport => {
+        const next = createUpstreamStdioTransport(options.spec, options.spawnPolicy ?? {});
+        audit.record({
+            kind: 'spawn',
+            serverId,
+            detail: {
+                command: next.audit.command,
+                args: next.audit.args,
+                cwd: next.audit.cwd,
+                envKeys: next.audit.envKeys,
+                warnings: next.audit.warnings.map(w => w.ruleId),
+                reason: 'reconnect'
+            }
+        });
+        currentUpstream = next.transport;
+        options.onUpstreamTransport?.(next.transport);
+        return next.transport;
+    };
+
     const proxy = new ToolwallProxy({
         clientTransport: options.clientTransport,
         upstreamTransport: upstream.transport,
+        createUpstreamTransport,
+        // Enabled by default; `{ enabled: false }` restores the week-1 behaviour.
+        reconnect: { enabled: true, ...(options.reconnect ?? {}) },
         serverId,
         era,
         guards: pipeline,
@@ -309,6 +369,9 @@ export function assembleToolwall(options: ToolwallOptions): Toolwall {
         tools,
         spawnAudit: upstream.audit,
         upstreamTransport: upstream.transport,
+        get currentUpstreamTransport(): StdioClientTransport {
+            return currentUpstream;
+        },
         registeredGuards,
         start: () => proxy.start(),
         close: () => proxy.close(),
@@ -359,6 +422,38 @@ function recordProxyEvent(audit: AuditLog, serverId: string, event: ProxyEvent):
         case 'client-closed':
             audit.record({ kind: 'lifecycle', serverId, detail: { event: event.kind } });
             return;
+        case 'upstream-reconnecting':
+            audit.record({
+                kind: 'lifecycle',
+                serverId,
+                detail: { event: event.kind, attempt: event.attempt, maxAttempts: event.maxAttempts, buffered: event.buffered }
+            });
+            return;
+        case 'upstream-reconnected':
+            audit.record({
+                kind: 'lifecycle',
+                serverId,
+                detail: { event: event.kind, attempt: event.attempt, downtimeMs: event.downtimeMs, released: event.released }
+            });
+            return;
+        case 'upstream-reconnect-refused':
+            // The severe one: the process that came back is not the one that was approved.
+            audit.record({
+                kind: 'blocked',
+                serverId,
+                method: 'tools/list',
+                direction: 'response',
+                findings: event.findings,
+                detail: { event: event.kind, buffered: event.buffered }
+            });
+            return;
+        case 'upstream-reconnect-failed':
+            audit.record({
+                kind: 'lifecycle',
+                serverId,
+                detail: { event: event.kind, attempts: event.attempts, buffered: event.buffered, error: event.error.message }
+            });
+            return;
         default: {
             const exhaustive: never = event;
             void exhaustive;
@@ -389,6 +484,42 @@ export type { StrictnessTier } from './policy/schema.js';
 
 export { ToolwallProxy, GuardBlockedError, RelayedRpcError } from './transport/proxy.js';
 export type { ProxyEvent, ToolwallProxyOptions } from './transport/proxy.js';
+export {
+    DEFAULT_RECONNECT_POLICY,
+    ReconnectGate,
+    UpstreamUnavailableError,
+    REPLAYABLE_READ_ONLY_METHODS,
+    isReplayableMethod,
+    resolveReconnectPolicy,
+    totalBackoffMs
+} from './transport/reconnect.js';
+export type { ReconnectPolicy, ReplayPolicy, LinkState } from './transport/reconnect.js';
+export {
+    ExchangeCorrelator,
+    MRTR_EMBEDDED_METHODS,
+    INPUT_REQUIRED,
+    eraUsesMrtr,
+    hashRequestState,
+    isInputRequired,
+    readInputRequests,
+    readRequestState,
+    readResultType
+} from './transport/mrtr.js';
+export type { EmbeddedInputRequest, ResultType } from './transport/mrtr.js';
+export {
+    HEADER_METHOD,
+    HEADER_NAME,
+    HEADER_PARAM_PREFIX,
+    HEADER_PROTOCOL_VERSION,
+    HEADER_VALIDATING_REVISIONS,
+    META_PROTOCOL_VERSION,
+    decodeMirroredHeaderValue,
+    encodeMirroredHeaderValue,
+    mirroredHeadersForBody,
+    needsSentinel,
+    verifyHeaderBodyAgreement
+} from './transport/headers.js';
+export type { HeaderCheck, HeaderCheckOptions, HeaderViolation, IncomingHeaders } from './transport/headers.js';
 export { DefaultGuardPipeline, ANY_METHOD } from './transport/pipeline.js';
 export type { GuardPipeline, GuardRegistration, PipelineOutcome } from './transport/pipeline.js';
 export {

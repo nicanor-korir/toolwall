@@ -20,8 +20,75 @@ export {
 } from "./canonicalize.js";
 export type { CanonicalizationErrorCode, CanonicalizeOptions } from "./canonicalize.js";
 
-export { containsInvisible, diffValues, escapeInvisible, renderFieldDiffs } from "./diff.js";
-export type { DiffKind, DiffOptions, FieldDiff, RenderOptions } from "./diff.js";
+export {
+  classifyChange,
+  containsInvisible,
+  diffValues,
+  escapeInvisible,
+  renderDriftAlert,
+  renderFieldDiffs,
+} from "./diff.js";
+export type {
+  ChangeImpact,
+  DiffKind,
+  DiffOptions,
+  DriftAlertOptions,
+  FieldDiff,
+  RenderOptions,
+} from "./diff.js";
+
+/**
+ * Invisible-character / ANSI rejection (RESEARCH-BRIEF §4.4: "narrow but real — near-zero FP").
+ * Measured at 0.0% false positives across 90 benign metadata cases; see `test/unit/unicode-fp.test.ts`.
+ * It **rejects** and never strips: a stripped description is one an attacker edited and we
+ * laundered.
+ */
+export {
+  DEFAULT_HAZARD_POLICY,
+  HAZARD_CLASS_LABEL,
+  UNICODE_GUARD_RESPONSE_METHODS,
+  UnicodeHygieneGuard,
+  codePointLabel,
+  decodeTagBlock,
+  hasHazard,
+  hazardFinding,
+  rankedClasses,
+  renderSurfaceHazards,
+  renderVisible,
+  scanSurface,
+  scanText,
+} from "./unicode.js";
+export type {
+  Hazard,
+  HazardClass,
+  HazardDisposition,
+  ScanOptions,
+  SurfaceHazard,
+  SurfaceScanOptions,
+  TextScanResult,
+  UnicodeHygieneGuardOptions,
+} from "./unicode.js";
+
+/**
+ * Composed `agent-threat-rules` detector. **Advisory by default and not constructed unless an
+ * operator opts in** — measured at 6.5% FP / 62.5% catch on the `alert` lane; see the header of
+ * `./rules.ts` for the full table and why `enforce` (0% FP, 0% catch) is not the default.
+ */
+export {
+  ATR_GUARD_RESPONSE_METHODS,
+  AtrAdvisoryGuard,
+  AtrScanner,
+  METADATA_RULE_CATEGORIES,
+  atrEngineConfig,
+  metadataUnits,
+} from "./rules.js";
+export type {
+  AtrAdvisoryGuardOptions,
+  AtrLane,
+  AtrMode,
+  AtrScannerOptions,
+  MetadataUnit,
+} from "./rules.js";
 
 export {
   SERVER_INSTRUCTIONS_SUBJECT,

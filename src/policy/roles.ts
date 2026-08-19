@@ -11,7 +11,7 @@ import type { ArgumentRoles } from "./schema.js";
  *
  * Instead a role is bound to an argument *location*, from two sources only:
  *
- *  1. The operator's policy (`roles.readPath`, `roles.writePath`, `roles.url`), as JSON Pointer
+ *  1. The operator's policy (`roles.readPath`, `roles.writePath`, `roles.url`, `roles.host`), as JSON Pointer
  *     selectors with `*` as a single-segment wildcard: `/path`, `/paths/*`, `/edits/<*>/file_path` (wildcard shown as <*> here to avoid closing this comment).
  *  2. The tool's own published `inputSchema`, where a string property declares `"format": "uri"`.
  *     The schema is a contract the server published; reading a role out of it is not guesswork.
@@ -22,7 +22,7 @@ import type { ArgumentRoles } from "./schema.js";
  * An argument with no bound role is not examined for capability purposes at all.
  */
 
-export type Role = "readPath" | "writePath" | "url";
+export type Role = "readPath" | "writePath" | "url" | "host";
 
 export interface RoleTarget {
   readonly role: Role;
@@ -121,6 +121,10 @@ export function collectRoleTargets(
     const c = compile("url", s);
     if (c) selectors.push(c);
   }
+  for (const s of roles.host) {
+    const c = compile("host", s);
+    if (c) selectors.push(c);
+  }
   if (roles.deriveUrlFromSchema && tool) {
     for (const s of deriveUrlSelectors(tool)) {
       const c = compile("url", s);
@@ -168,7 +172,7 @@ export function collectRoleTargets(
  * whether a capability is "exercised" for the undeclared-capability check.
  */
 export function hasAnyRole(roles: ArgumentRoles, tool: ToolDefinition | undefined): boolean {
-  if (roles.readPath.length > 0 || roles.writePath.length > 0 || roles.url.length > 0) return true;
+  if (roles.readPath.length > 0 || roles.writePath.length > 0 || roles.url.length > 0 || roles.host.length > 0) return true;
   if (roles.deriveUrlFromSchema && tool) return deriveUrlSelectors(tool).length > 0;
   return false;
 }

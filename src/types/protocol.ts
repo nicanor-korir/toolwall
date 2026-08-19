@@ -59,6 +59,67 @@ export function isProtocolEra(value: unknown): value is ProtocolEra {
  */
 export type GuardDirection = 'request' | 'response';
 
+/**
+ * Where a payload sits in a multi-message exchange.
+ *
+ * Added in week 2 for MRTR (`docs/RESEARCH-BRIEF.md` §1.3). Every field is
+ * optional and every field is written by **toolwall**, never copied from the
+ * server: a guard may read this without treating it as attacker-controlled.
+ *
+ * Under `2026-07-28` a server answers a `tools/call` with
+ * `resultType: "input_required"` plus `inputRequests` — sampling, elicitation
+ * and roots requests embedded *inside a result*. The retry that follows carries
+ * a **different JSON-RPC id**, so id alone cannot tie the two halves of the
+ * exchange together. `exchangeId` does: it is stable across the whole round
+ * trip, including the retry.
+ */
+export interface MessageCorrelation {
+    /**
+     * Stable per-proxy identifier for one logical exchange, preserved across an
+     * `input_required` round trip even though the JSON-RPC id changes. Opaque;
+     * meaningful only within a single toolwall process.
+     */
+    readonly exchangeId: string;
+    /**
+     * JSON-RPC id of the message on the leg it arrived on, when there is one.
+     * Absent for notifications and for payloads toolwall originated itself
+     * (the re-verification listing after a reconnect).
+     */
+    readonly requestId?: string | number;
+    /**
+     * For a payload lifted out of an enclosing message, the method of that
+     * enclosing message — e.g. `"tools/call"` for a `sampling/createMessage`
+     * found in its `inputRequests`. Absent for a payload inspected in its own
+     * right.
+     */
+    readonly outerMethod?: string;
+    /**
+     * The server-assigned key this payload sat under in
+     * `InputRequiredResult.inputRequests`. Server-controlled *data*: it is
+     * carried so a guard can point at the right entry, and MUST NOT be treated
+     * as trusted.
+     */
+    readonly inputRequestKey?: string;
+    /**
+     * SHA-256 of the `requestState` that accompanied this exchange, hex, or
+     * `undefined` when there was none.
+     *
+     * The spec is explicit that `requestState` is opaque and that a client
+     * **MUST NOT parse it**; toolwall hashes it for correlation and never
+     * inspects, decodes, stores or rewrites the value itself. The hash is what
+     * links a retry back to the exchange that asked for input.
+     */
+    readonly requestStateHash?: string;
+    /**
+     * True when this payload is the client's retry of an earlier
+     * `input_required` exchange — i.e. it echoed a `requestState` toolwall has
+     * seen before.
+     */
+    readonly isRetry?: boolean;
+    /** True when toolwall originated this message rather than relaying a peer's. */
+    readonly synthetic?: boolean;
+}
+
 export interface GuardContext {
     readonly era: ProtocolEra;
     /**
@@ -74,8 +135,23 @@ export interface GuardContext {
      */
     readonly serverId: string;
     readonly direction: GuardDirection;
-    /** JSON-RPC method the payload belongs to, e.g. `"tools/call"`. */
+    /**
+     * JSON-RPC method the payload belongs to, e.g. `"tools/call"`.
+     *
+     * For an MRTR payload lifted out of `inputRequests` this is the **embedded**
+     * method (`sampling/createMessage`, `elicitation/create`, `roots/list`), not
+     * the enclosing `tools/call`. That is deliberate: a guard registered for
+     * `("response", "sampling/createMessage")` then fires under **both** eras —
+     * on the live server->client request under `2025-11-25`, and on the embedded
+     * copy under `2026-07-28` — without knowing which era it is running in. The
+     * enclosing method is available as `correlation.outerMethod`.
+     */
     readonly method: string;
+    /**
+     * Where this payload sits in a multi-message exchange. Optional and purely
+     * additive: guards written before week 2 ignore it and stay correct.
+     */
+    readonly correlation?: MessageCorrelation;
 }
 
 // ---------------------------------------------------------------------------
@@ -208,3 +284,29 @@ export function isReservedMcpErrorCode(code: number): boolean {
 export const TOOLWALL_INTERNAL_ERROR = -32603;
 /** JSON-RPC "Invalid request". Default code for a policy block. */
 export const TOOLWALL_BLOCKED = -32600;
+
+/**
+ * `-32020 HeaderMismatch`, defined by the MCP spec (`docs/RESEARCH-BRIEF.md` §1.9).
+ *
+ * This sits **inside** the reserved `-32020..-32099` range that `GuardPipeline`
+ * rewrites, and that is correct: the rule is that implementations MUST NOT
+ * *invent* codes in that range. `-32020` is not invented — it is the code the
+ * spec assigns to exactly this condition, "the mirrored headers disagree with
+ * the JSON-RPC body". So it is emitted **by the transport**, from
+ * `src/transport/headers.ts`, and never by a guard. A guard returning `-32020`
+ * would still be rewritten to `-32600`, because a guard cannot know it is
+ * speaking about the spec's condition rather than its own.
+ */
+export const MCP_HEADER_MISMATCH = -32020;
+
+/**
+ * `-32022 UnsupportedProtocolVersion`, defined by the MCP spec (§1.9).
+ *
+ * Emitted by `src/transport/headers.ts` when a request declares a revision that
+ * does **not** mandate header/body mirroring. The spec tells intermediaries
+ * enforcing policy on mirrored headers to verify the revision requires
+ * header-body validation and to *reject* otherwise rather than trusting
+ * unvalidated headers — so this is a refusal to police, not a claim the version
+ * is unknown. Same reserved-range reasoning as `MCP_HEADER_MISMATCH`.
+ */
+export const MCP_UNSUPPORTED_PROTOCOL_VERSION = -32022;

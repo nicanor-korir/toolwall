@@ -28,8 +28,12 @@ const closeAll = async (): Promise<void> => {
 const settle = (ms = 300): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
 describe('the client session degrades gracefully, never silently', () => {
-    it('an upstream killed mid-request tears the client side down cleanly instead of hanging', async () => {
-        const peer = await connectAssembled();
+    it('with reconnection off, an upstream killed mid-request tears the client side down cleanly instead of hanging', async () => {
+        // The week-1 behaviour, kept and still asserted. Week 2 added buffering
+        // and retry, and made it the default — `--no-reconnect` selects this.
+        // Both dispositions are defensible and the difference is visible here:
+        // this one ends the session, the next one keeps it.
+        const peer = await connectAssembled({ reconnect: { enabled: false } });
         peers.push(peer);
         try {
             await peer.handshake();
@@ -52,6 +56,8 @@ describe('the client session degrades gracefully, never silently', () => {
             expect(peer.toolwall.proxy.closed).toBe(true);
             expect(peer.events.map(e => e.kind)).toContain('upstream-closed');
             expect(peer.events.map(e => e.kind)).toContain('client-closed');
+            // Nothing was attempted, because nothing was asked for.
+            expect(peer.events.map(e => e.kind)).not.toContain('upstream-reconnecting');
 
             // The audit log says why the session ended.
             const lifecycle = peer.audit.records.filter(r => r.kind === 'lifecycle');
@@ -60,6 +66,35 @@ describe('the client session degrades gracefully, never silently', () => {
             await closeAll();
         }
     });
+
+    it('with reconnection on (the default), the same kill keeps the session alive and answers the in-flight request', async () => {
+        const peer = await connectAssembled();
+        peers.push(peer);
+        try {
+            await peer.handshake();
+            await peer.call('tools/list');
+
+            const pid = peer.toolwall.upstreamTransport.pid;
+            peer.send({ jsonrpc: '2.0', id: 99, method: 'tools/call', params: { name: 'hang', arguments: {} } });
+            await settle(250);
+            process.kill(pid as number, 'SIGKILL');
+
+            // The in-flight `tools/call` is NOT resent — its execution status is
+            // unknown — but the client is told so explicitly rather than left
+            // holding a request nobody will ever answer.
+            const answer = await peer.out.waitForId(99);
+            expect(errorOf(answer)?.code).toBe(-32603);
+            expect(errorOf(answer)?.message).toContain('execution status is unknown');
+
+            // And the session is still usable, on a freshly verified process.
+            for (let i = 0; i < 100 && peer.toolwall.proxy.linkState !== 'connected'; i++) await settle(50);
+            expect(peer.toolwall.proxy.closed).toBe(false);
+            expect(errorOf(await peer.call('tools/call', { name: 'echo', arguments: { text: 'alive' } }))).toBeUndefined();
+            expect(peer.events.map(e => e.kind)).toContain('upstream-reconnected');
+        } finally {
+            await closeAll();
+        }
+    }, 30_000);
 
     it('malformed framing from the client is reported and survived, not fatal', async () => {
         const peer = await connectAssembled();

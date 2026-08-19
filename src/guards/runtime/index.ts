@@ -2,3 +2,9 @@ export { SchemaGuard, extractToolCall, checkFormat, looksCatastrophic } from "./
 export type { SchemaGuardOptions } from "./schema-guard.js";
 export { CapabilityGuard, measure } from "./capability-guard.js";
 export type { CapabilityGuardOptions, ArgumentShape } from "./capability-guard.js";
+export { SchemaValidator } from "./json-schema.js";
+export type { ValidationTarget } from "./json-schema.js";
+export { ResultGuard, RESULT_METHODS, SERVER_REQUEST_METHODS, errorTextNames, hasProtoKey } from "./result-guard.js";
+export type { ResultGuardOptions } from "./result-guard.js";
+export { BudgetedConfirmationProvider, ttyChannel, renderPrompt } from "./confirm.js";
+export type { ConfirmationChannel, ConfirmationOutcome, ConfirmationRecord, BudgetedConfirmationOptions } from "./confirm.js";

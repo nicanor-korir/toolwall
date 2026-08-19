@@ -12,7 +12,7 @@ import {
 import type { ResolvedPolicy } from "../../policy/parse.js";
 import type { ArgumentBounds, CapabilityGrant, FilesystemGrant } from "../../policy/schema.js";
 import { canonicalizePath, contains, defaultCaseInsensitive, nodeFsProbe, type FsProbe } from "../../policy/containment.js";
-import { evaluateUrl } from "../../policy/hosts.js";
+import { dedupeTargets, evaluateEgressTarget, scanForUrls, type EgressTarget } from "../../policy/egress.js";
 import { collectRoleTargets, hasAnyRole, type Role, type RoleTarget } from "../../policy/roles.js";
 import { assessMutation } from "../../policy/annotations.js";
 import { extractToolCall } from "./schema-guard.js";
@@ -26,7 +26,12 @@ import { extractToolCall } from "./schema-guard.js";
  *     mitigation for the T-08 oversized/deeply-nested payload class against the proxy itself.
  *  3. **Filesystem containment** — canonical, symlink-resolved, segment-wise. CVE-2025-53110 and
  *     CVE-2025-53109 live here; see `src/policy/containment.ts` for the mechanism.
- *  4. **Egress** — host and scheme allowlist on URL-role arguments.
+ *  4. **Egress** — two intersected allowlists on URL- and host-role arguments: the per-server
+ *     `egress` block (deny-by-default once declared, an upper bound on every tool) and the per-tool
+ *     `network` grant (narrows further, never widens). In `enforce: "scan"` mode the server-level
+ *     layer additionally reads absolute URLs out of every string argument. Note the honest scope:
+ *     this constrains where the MODEL can direct a call, not what a compromised server opens on
+ *     its own sockets — see `src/policy/egress.ts`.
  *  5. **Mutation** — whether this tool may change state at all, using `ToolAnnotations` strictly as
  *     an input signal and never as authorization.
  *
@@ -112,7 +117,18 @@ export class CapabilityGuard implements Guard {
     // 3/4. Capability roles ------------------------------------------
     const targets = collectRoleTargets(params.arguments ?? {}, grant.roles, tool);
     const usesFs = targets.some((t) => t.role === "readPath" || t.role === "writePath");
-    const usesNet = targets.some((t) => t.role === "url");
+
+    const egress = this.#policy.egressFor(ctx.serverId);
+    const serverEgressActive = egress.declared && egress.enforce !== "off";
+    const egressTargets = dedupeTargets([
+      ...targets
+        .filter((t) => t.role === "url" || t.role === "host")
+        .map((t): EgressTarget => ({ pointer: t.pointer, value: t.value, kind: t.role === "host" ? "host" : "url", discovery: "role" })),
+      // `scan` reaches into arguments no role covers. Only reachable when the operator declared an
+      // egress block AND asked for it; see EgressPolicy for the measured cost of that choice.
+      ...(serverEgressActive && egress.enforce === "scan" ? scanForUrls(params.arguments ?? {}) : []),
+    ]);
+    const usesNet = egressTargets.length > 0;
 
     if (usesFs) {
       if (grant.filesystem === undefined) {
@@ -127,12 +143,16 @@ export class CapabilityGuard implements Guard {
     }
 
     if (usesNet) {
-      if (grant.network === undefined) {
+      // Two allowlists, intersected: the per-server `egress` block (deny-by-default once declared,
+      // an upper bound on every tool) and the per-tool `network` grant (narrows further). Scanned
+      // targets exist only in `enforce: "scan"`, which requires a declared block, so they can never
+      // route into the "undeclared capability" branch below.
+      if (!serverEgressActive && grant.network === undefined) {
         raise(this.#undeclared(findings, params.name, "network", grant, ctx));
       } else {
-        for (const t of targets) {
-          if (t.role !== "url") continue;
-          const decision = evaluateUrl(t.value, grant.network);
+        for (const t of egressTargets) {
+          const outcome = evaluateEgressTarget(t, serverEgressActive ? egress : undefined, grant.network);
+          const decision = outcome.decision;
           if (decision.ok) {
             for (const note of decision.notes) {
               findings.push({
@@ -146,15 +166,27 @@ export class CapabilityGuard implements Guard {
             }
             continue;
           }
+          const d: Disposition =
+            outcome.layer === "server" ? (egress.onViolation === "allow" ? "allow" : egress.onViolation) : "block";
           findings.push({
-            ruleId: `toolwall/egress.${decision.reason}`,
-            severity: "high",
+            ruleId: outcome.layer === "server" ? "toolwall/egress.server-allowlist" : `toolwall/egress.${decision.reason}`,
+            severity: d === "allow" ? "low" : "high",
             locus: `/arguments${t.pointer}`,
-            message: describeEgress(decision.reason, decision.detail),
-            remediation: egressRemediation(decision.reason, decision.detail, ctx.serverId, params.name),
-            evidence: { tool: params.name, reason: decision.reason, detail: decision.detail },
+            message:
+              describeEgress(decision.reason, decision.detail) +
+              (outcome.layer === "server" ? ` Denied by the server-level egress allowlist for "${ctx.serverId}".` : "") +
+              (t.discovery === "scan" ? " The destination was found by scanning argument text, not in an argument bound to a URL role." : ""),
+            remediation: egressRemediation(decision.reason, decision.detail, ctx.serverId, params.name, outcome.layer),
+            evidence: {
+              tool: params.name,
+              reason: decision.reason,
+              detail: decision.detail,
+              layer: outcome.layer ?? "none",
+              discovery: t.discovery,
+              kind: t.kind,
+            },
           });
-          raise("block");
+          raise(d);
         }
       }
     }
@@ -391,7 +423,15 @@ function describeEgress(reason: string, detail: string): string {
   }
 }
 
-function egressRemediation(reason: string, detail: string, serverId: string, toolName: string): string {
+function egressRemediation(reason: string, detail: string, serverId: string, toolName: string, layer: "server" | "tool" | undefined): string {
+  if (layer === "server") {
+    const hosts = `servers["${serverId}"].egress.hosts`;
+    return (
+      `Add "${detail}" to ${hosts} if this destination is intended, or remove the servers["${serverId}"].egress block to stop enforcing a server-level allowlist. ` +
+      "The server-level allowlist is deny-by-default and is an upper bound: a per-tool network grant can narrow it but never widen it. " +
+      "Note the limit of this control — it constrains where the MODEL can direct a tool, not what a compromised server does on its own sockets."
+    );
+  }
   const at = `servers["${serverId}"].tools["${toolName}"].network`;
   switch (reason) {
     case "scheme-not-granted":

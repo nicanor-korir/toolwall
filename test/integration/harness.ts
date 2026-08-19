@@ -26,14 +26,18 @@ import { PinStore } from '../../src/audit/manifest.js';
 import type { PinEvent } from '../../src/guards/metadata/drift.js';
 import type { ResolvedPolicy } from '../../src/policy/parse.js';
 import { assembleToolwall, type GuardToggles, type Toolwall } from '../../src/index.js';
+import type { ReconnectPolicy } from '../../src/transport/reconnect.js';
 import { ToolwallProxy, type ProxyEvent } from '../../src/transport/proxy.js';
 import { createUpstreamStdioTransport } from '../../src/transport/spawn.js';
 import type { GuardPipeline } from '../../src/transport/pipeline.js';
+import type { ProtocolEra } from '../../src/types/protocol.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const FIXTURE_SERVER = path.resolve(here, '../fixtures/downstream-server.mjs');
 export const POISONED_SERVER = path.resolve(here, '../fixtures/malicious/poisoned-server.js');
 export const RUGPULL_SERVER = path.resolve(here, '../fixtures/malicious/rugpull-server.js');
+export const RESTARTING_SERVER = path.resolve(here, '../fixtures/restarting-server.mjs');
+export const MRTR_SERVER = path.resolve(here, '../fixtures/mrtr-server.mjs');
 
 export interface JsonRpcLine {
     readonly raw: string;
@@ -139,9 +143,21 @@ export interface ProxyPeer extends Peer {
     readonly events: ProxyEvent[];
 }
 
+export interface ProxyPeerOptions {
+    readonly guards?: GuardPipeline;
+    /** Path to the server script. Defaults to the benign fixture. */
+    readonly server?: string;
+    readonly serverArgs?: readonly string[];
+    /** Protocol era. Defaults to `2025-11-25`, the era the SDK actually speaks. */
+    readonly era?: ProtocolEra;
+}
+
 /** A connection to the fixture server through a real ToolwallProxy. */
-export async function connectThroughProxy(options: { guards?: GuardPipeline } = {}): Promise<ProxyPeer> {
-    const upstream = createUpstreamStdioTransport({ command: process.execPath, args: [FIXTURE_SERVER] }, { allowedCommands: ['node'] });
+export async function connectThroughProxy(options: ProxyPeerOptions = {}): Promise<ProxyPeer> {
+    const upstream = createUpstreamStdioTransport(
+        { command: process.execPath, args: [options.server ?? FIXTURE_SERVER, ...(options.serverArgs ?? [])] },
+        { allowedCommands: ['node'] }
+    );
 
     const toProxy = new PassThrough();
     const fromProxy = new PassThrough();
@@ -154,6 +170,7 @@ export async function connectThroughProxy(options: { guards?: GuardPipeline } = 
         upstreamTransport: upstream.transport,
         serverId: upstream.serverId,
         ...(options.guards !== undefined ? { guards: options.guards } : {}),
+        ...(options.era !== undefined ? { era: options.era } : {}),
         onEvent: event => events.push(event)
     });
 
@@ -214,6 +231,12 @@ export interface AssembledOptions {
     readonly pins?: PinStore;
     /** Reuse an existing temp dir alongside `pins`. */
     readonly dir?: string;
+    /**
+     * Reconnection policy. `assembleToolwall` enables it by default; pass
+     * `{ enabled: false }` for the week-1 behaviour where an upstream close ends
+     * the session immediately.
+     */
+    readonly reconnect?: Partial<ReconnectPolicy>;
 }
 
 export async function connectAssembled(options: AssembledOptions = {}): Promise<AssembledPeer> {
@@ -244,6 +267,13 @@ export async function connectAssembled(options: AssembledOptions = {}): Promise<
         ...(options.onUnverifiable !== undefined ? { onUnverifiable: options.onUnverifiable } : {}),
         ...(options.enable !== undefined ? { enable: options.enable } : {}),
         baseDir: dir,
+        ...(options.reconnect !== undefined ? { reconnect: options.reconnect } : {}),
+        // Every upstream process, including the ones a reconnect spawns, gets its
+        // piped stderr drained. An undrained PassThrough eventually blocks the
+        // child's writes, which would look like a hang in the reconnect tests.
+        onUpstreamTransport: transport => {
+            transport.stderr?.resume();
+        },
         onEvent: event => events.push(event),
         onPinEvent: event => pinEvents.push(event)
     });

@@ -15,6 +15,31 @@
  * point, and a change consisting only of invisible characters is called out by name.
  *
  * This is rendering, not detection. It makes no claim about whether a change is hostile.
+ *
+ * ## The alert-fatigue constraint on `renderDriftAlert`
+ *
+ * Trail of Bits names the failure mode for this whole product category: *"alert fatigue will take
+ * its toll, and users may miss signs of malicious behavior (or, worse, stop using MCP security
+ * controls altogether)."* `docs/RESEARCH-BRIEF.md` §4.3 puts a number on the human at the other
+ * end — Anthropic, n=1,053 paid developers, harmful commands substituted mid-session: developers
+ * approved the dangerous action **86.4% of the time.** An alert that requires reading is an alert
+ * that will not be read.
+ *
+ * So the drift block is built to four rules, and every one of them is a constraint on this file:
+ *
+ *   1. **The first line decides.** It names the thing, the server, and how many fields moved. An
+ *      operator who reads nothing else must still know whether to keep going.
+ *   2. **Ranked, not chronological.** A changed `description` goes into the model's system prompt;
+ *      a changed `icons[0].src` does not. They are not the same event and must not be the same
+ *      size on screen. `classifyChange` is that ranking, and it is why an alert about a poisoned
+ *      description never opens with an icon URL.
+ *   3. **Consequence, not just delta.** Each ranked change carries one sentence saying what the
+ *      field *does*. "`/inputSchema/properties/path/enum` changed" is a fact; "the set of values
+ *      this argument accepts widened, which legalises arguments that were previously rejected" is
+ *      a decision.
+ *   4. **Bounded.** A hostile server can change 400 fields to bury one. The block shows the
+ *      highest-ranked few and says how many it withheld, rather than producing a wall nobody
+ *      finishes.
  */
 
 /** Characters that are invisible, direction-altering, or otherwise not faithfully rendered. */
@@ -53,6 +78,12 @@ function codePointLabel(char: string): string {
     0x09: "TAB",
     0x0a: "LF",
     0x0d: "CR",
+    // Named because a bare `‹U+001B›` tells an operator nothing, and ESC is the one control
+    // character that can rewrite what the rest of their terminal already showed them. Trail of
+    // Bits render it as the literal string ESC for exactly this reason.
+    0x1b: "ESC",
+    0x7f: "DEL",
+    0x9b: "CSI",
     0x200b: "ZWSP",
     0x200c: "ZWNJ",
     0x200d: "ZWJ",
@@ -264,5 +295,218 @@ export function renderFieldDiffs(diffs: FieldDiff[], options: RenderOptions = {}
         break;
     }
   }
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Impact ranking and the drift alert — see the "alert-fatigue constraint" in the header
+// ---------------------------------------------------------------------------
+
+/** How much a changed field matters, and the one sentence that says why. */
+export interface ChangeImpact {
+  /** 0–100. Higher sorts first and drives what an operator reads before they stop reading. */
+  readonly rank: number;
+  /** What this field does, in one sentence. Written for someone deciding, not documenting. */
+  readonly why: string;
+}
+
+/** Last non-numeric pointer segment, e.g. `description` for `/tools/0/description`. */
+function lastNamedSegment(path: string): string {
+  const segments = path.split("/").filter((s) => s !== "" && !/^\d+$/.test(s));
+  return segments[segments.length - 1] ?? "";
+}
+
+/**
+ * Rank a change by what the field it touches can actually do.
+ *
+ * The ordering is the threat model, not aesthetics. Text that reaches the model's context ranks
+ * above structure; structure ranks above hints; hints rank above presentation. In particular a
+ * schema change ranks high for the reason contract C-1 exists: an attacker who widens their own
+ * schema makes previously-rejected arguments valid, so the rug pull legalises the payload.
+ */
+export function classifyChange(diff: FieldDiff): ChangeImpact {
+  const path = diff.path;
+  const segment = lastNamedSegment(path);
+  const inSchema = path.includes("/inputSchema") || path.includes("/outputSchema");
+
+  if (path === "/instructions" || segment === "instructions") {
+    return {
+      rank: 100,
+      why: "server instructions are placed directly into the client's system prompt by design — this is the highest-value target on the whole surface",
+    };
+  }
+  if (!inSchema && segment === "description") {
+    return {
+      rank: 98,
+      why: "the tool description is concatenated into the model's system prompt, so this text is read as instruction on every turn",
+    };
+  }
+  if (segment === "name") {
+    return {
+      rank: 95,
+      why: "the tool's wire name is its identity; a changed name can shadow another server's tool or re-point an approval",
+    };
+  }
+  if (inSchema && (segment === "description" || segment === "title")) {
+    return {
+      rank: 90,
+      why: "schema field descriptions reach the model whenever it prepares a call to this tool — the same channel as the tool description, one level down",
+    };
+  }
+  if (segment === "enum" || /\/enum\/\d+$/.test(path)) {
+    return {
+      rank: 85,
+      why: "an enum bounds what this argument may be; widening it makes values valid that the pinned contract rejected",
+    };
+  }
+  if (
+    inSchema &&
+    (segment === "required" ||
+      segment === "additionalProperties" ||
+      segment === "type" ||
+      segment === "properties" ||
+      segment === "pattern" ||
+      segment === "format")
+  ) {
+    return {
+      rank: 84,
+      why: "argument validation runs against the PINNED schema (contract C-1); a server that widens its own schema is trying to make arguments valid that were not",
+    };
+  }
+  if (inSchema) {
+    return {
+      rank: 80,
+      why: "part of the tool's argument contract — the thing argument validation is checked against",
+    };
+  }
+  if (!inSchema && (segment === "title" || path.startsWith("/annotations/title"))) {
+    return { rank: 70, why: "the display name a human sees when approving this tool" };
+  }
+  if (path.includes("/annotations")) {
+    return {
+      rank: 65,
+      why: "annotations are HINTS, never guarantees — the spec says never to make tool-use decisions on them from an untrusted server, so a tool newly claiming readOnly is claiming, not proving",
+    };
+  }
+  if (path.includes("/icons")) {
+    return { rank: 30, why: "presentation only; an icon URL is still a URL the client may fetch" };
+  }
+  if (path.includes("/_meta")) {
+    return { rank: 25, why: "transport bookkeeping, but attacker-controlled text all the same" };
+  }
+  return { rank: 50, why: "part of the definition that was approved" };
+}
+
+export interface DriftAlertOptions {
+  /** e.g. `tool "send_email"` or `server instructions`. Goes in the headline. */
+  readonly subject: string;
+  readonly serverId: string;
+  readonly pinnedHash: string;
+  readonly liveHash: string;
+  readonly diffs: readonly FieldDiff[];
+  /** Authorization scope, when there is one. Shown only when it is not the default. */
+  readonly scope?: string;
+  /**
+   * Scopes under which this exact live definition is ALREADY pinned. Non-empty turns the alert
+   * from "your server may have been swapped" into "your credential changed", which is a different
+   * decision and usually the right one.
+   */
+  readonly alsoPinnedUnderScopes?: readonly string[];
+  /** How many changes to show in full. Default 5. The rest are counted, not printed. */
+  readonly maxFields?: number;
+  readonly maxValueLength?: number;
+}
+
+/** Human-readable character-count delta for a string change, e.g. `+41 characters`. */
+function lengthDelta(diff: FieldDiff): string | undefined {
+  if (diff.kind !== "changed") return undefined;
+  if (typeof diff.before !== "string" || typeof diff.after !== "string") return undefined;
+  const delta = [...diff.after].length - [...diff.before].length;
+  if (delta === 0) return undefined;
+  return `${delta > 0 ? "+" : ""}${delta} characters`;
+}
+
+/**
+ * The block a human reads when a definition drifted. Headline, then why it matters, then the
+ * evidence, then what to do — in that order, because that is the order in which a reader stops.
+ *
+ * See the "alert-fatigue constraint" section of this file's header for the four rules this
+ * implements and the research behind them.
+ */
+export function renderDriftAlert(options: DriftAlertOptions): string {
+  const maxFields = options.maxFields ?? 5;
+  const maxValueLength = options.maxValueLength ?? 400;
+  const diffs = [...options.diffs];
+  const ranked = diffs
+    .map((diff) => ({ diff, impact: classifyChange(diff) }))
+    .sort((a, b) => b.impact.rank - a.impact.rank || a.diff.path.localeCompare(b.diff.path));
+
+  const shown = ranked.slice(0, maxFields);
+  const withheld = ranked.length - shown.length;
+  const invisible = diffs.filter((d) => d.invisibleOnly === true);
+  const count = diffs.length;
+
+  const lines: string[] = [];
+
+  // 1. The headline. Everything an operator who reads one line needs.
+  lines.push(
+    `DRIFT · ${options.subject} on ${options.serverId} changed in ${count} ` +
+      `field${count === 1 ? "" : "s"} since it was approved.`,
+  );
+  if (options.scope !== undefined && options.scope !== "") {
+    lines.push(`         authorization scope: ${options.scope}`);
+  }
+
+  // 2. The benign explanation, when the evidence supports one. Stated BEFORE the alarming part:
+  //    an operator who is about to be told their server was swapped deserves to know first that
+  //    these exact bytes are already approved somewhere.
+  const alsoPinned = options.alsoPinnedUnderScopes ?? [];
+  if (alsoPinned.length > 0) {
+    lines.push(
+      "",
+      "  LIKELY AN AUTHORIZATION CHANGE, NOT TAMPERING",
+      `    This exact definition is already pinned under ${alsoPinned.length} other ` +
+        `scope${alsoPinned.length === 1 ? "" : "s"} (${alsoPinned.join(", ")}). The bytes are ones ` +
+        "you already approved; what changed is which credential fetched them.",
+    );
+  }
+
+  // 3. Why it matters, ranked.
+  lines.push("", "  WHY IT MATTERS");
+  for (const { diff, impact } of shown) {
+    const delta = lengthDelta(diff);
+    const verb = diff.kind === "added" ? "appeared" : diff.kind === "removed" ? "was removed" : "changed";
+    lines.push(
+      `    · ${diff.path === "" ? "<whole definition>" : diff.path} ${verb}` +
+        `${delta === undefined ? "" : ` (${delta})`} — ${impact.why}`,
+    );
+  }
+  if (withheld > 0) {
+    lines.push(
+      `    · ${withheld} lower-impact change${withheld === 1 ? "" : "s"} not shown here; the full ` +
+        "list is in the audit record.",
+    );
+  }
+  if (invisible.length > 0) {
+    lines.push(
+      `    · ${invisible.length} change${invisible.length === 1 ? "" : "s"} consist ONLY of ` +
+        "characters that do not render. Comparing the raw text would show you two identical " +
+        "lines. Read the escaped values below.",
+    );
+  }
+
+  // 4. The evidence.
+  lines.push(
+    "",
+    "  WHAT CHANGED",
+    renderFieldDiffs(
+      shown.map((s) => s.diff),
+      { maxValueLength, indent: "    " },
+    ),
+  );
+
+  // 5. The two hashes, last: they prove the claim and nobody decides on them.
+  lines.push("", `    pinned hash : ${options.pinnedHash}`, `    live hash   : ${options.liveHash}`);
+
   return lines.join("\n");
 }

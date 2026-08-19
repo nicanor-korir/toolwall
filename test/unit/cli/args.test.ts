@@ -92,4 +92,37 @@ describe('parseArgs', () => {
         expect(parseArgs(['-h'])).toStrictEqual({ kind: 'help' });
         expect(parseArgs(['--version'])).toStrictEqual({ kind: 'version' });
     });
+
+    it('buffers and retries by default, because a blip should not end the session', () => {
+        const result = parseArgs(['--server', 'node a.js']);
+        expect(result.kind).toBe('run');
+        if (result.kind !== 'run') return;
+        expect(result.value.reconnect).toBe(true);
+        expect(result.value.reconnectAttempts).toBe(3);
+        // Never resend a side-effecting call whose execution status is unknown.
+        expect(result.value.replayInFlight).toBe('read-only-methods');
+    });
+
+    it('lets an operator turn reconnection off and tune it', () => {
+        const result = parseArgs([
+            '--no-reconnect',
+            '--reconnect-attempts',
+            '5',
+            '--replay-in-flight',
+            'all',
+            '--server',
+            'node a.js'
+        ]);
+        expect(result.kind).toBe('run');
+        if (result.kind !== 'run') return;
+        expect(result.value.reconnect).toBe(false);
+        expect(result.value.reconnectAttempts).toBe(5);
+        expect(result.value.replayInFlight).toBe('all');
+    });
+
+    it('rejects nonsense reconnection settings rather than coercing them', () => {
+        expect(parseArgs(['--reconnect-attempts', 'many', '--server', 'node a.js']).kind).toBe('error');
+        expect(parseArgs(['--reconnect-attempts', '-1', '--server', 'node a.js']).kind).toBe('error');
+        expect(parseArgs(['--replay-in-flight', 'sometimes', '--server', 'node a.js']).kind).toBe('error');
+    });
 });

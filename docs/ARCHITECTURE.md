@@ -274,3 +274,67 @@ p99 delta as a range, not a point.
 Not measured, and therefore not claimed: concurrency, large payloads, a cold pin store on a slow
 disk, and the `tools/list` cold path (canonicalize + hash per tool), which is where the real work
 happens and which a session pays once per listing rather than per call.
+
+---
+
+## Week-2 contracts from the runtime area (Dev 3) — binding
+
+### C-12 · The response leg needs a registration, and it is not `ANY_METHOD`
+`ResultGuard` (`src/guards/runtime/result-guard.ts`) must be registered on **six** `(direction,
+method)` pairs, and on the request leg as well as the response leg:
+
+```ts
+const resultGuard = new ResultGuard({ policy, tools /* the PINNED source */, audit: sink });
+for (const m of RESULT_METHODS)          // tools/call, resources/read, prompts/get
+  pipeline.register({ direction: 'response', method: m, guard: resultGuard });
+for (const m of SERVER_REQUEST_METHODS)  // elicitation/create, sampling/createMessage
+  pipeline.register({ direction: 'response', method: m, guard: resultGuard });
+pipeline.register({ direction: 'request', method: 'tools/call', guard: resultGuard });
+```
+
+The **request-leg** registration is not optional and it is not a convenience: it is where the
+guard learns which tool a result belongs to, and where the ATPA sequence check runs. Registering
+only the response leg silently disables `outputSchema` enforcement (nothing to correlate against)
+and ATPA entirely, with no error. Order relative to the other `tools/call` request guards does not
+matter — `ResultGuard` reads the params, never mutates them, and its only request-leg block is the
+ATPA one.
+
+`hasGuards()` stays false for every other method, so the transparency guarantee is unchanged for
+`resources/*` subscriptions, `completion/complete`, `roots/list`, `ping` and future methods.
+
+### C-13 · `GuardContext` has no correlation id, and one result leg needs one — REQUEST TO DEV 1
+`GuardContext` is `{ era, serverId, direction, method }`. A `tools/call` RESULT therefore does not
+say which tool produced it. `ResultGuard` correlates by tracking outbound calls per server and
+matching a result to the single call in flight; when more than one is in flight it declines to
+guess and emits `toolwall/result.uncorrelated` (`info`) rather than enforcing `outputSchema`
+against the wrong tool. **This is a real gap under concurrent tool calls.** The clean fix is an
+additive field on `GuardContext` — the JSON-RPC id, or any stable per-exchange token — carried
+identically on the request and response legs. Dev 1 owns that type; nothing was changed here.
+
+### C-14 · A `confirm` verdict is now resolvable, and the resolution is bounded
+`BudgetedConfirmationProvider` (`src/guards/runtime/confirm.ts`) implements Dev 1's
+`ConfirmationProvider`. Wiring notes for the integrator:
+
+- Construct it with `policy.confirmation` (new on `ResolvedPolicy`) and `ttyChannel()`.
+  `ttyChannel()` returns `undefined` when there is no controlling terminal; pass it through
+  anyway — an absent channel is the fail-closed path, not an error.
+- It **never writes to stdout** (C-3). Prompts go to `/dev/tty`; `onDecision` is the operator
+  channel for stderr.
+- The budget is per provider instance, i.e. **per session**. Do not construct one per call.
+- It renders only `ruleId` / `severity` / `locus` / `remediation` — the same allowlist as
+  `redactFindingForClient()` (C-9), so a poisoned server cannot compose its own approval dialog.
+- Rules not on `confirmation.promptableRules` are denied **without** prompting. That is the design,
+  not a bug: 86.4% approval on substituted harmful commands means the scarce thing is attention.
+
+### C-15 · `ResolvedPolicy` gained three members — additive, but they are not optional
+`egressFor(serverId)`, `responseFor(serverId)` and `confirmation`. Any hand-rolled `ResolvedPolicy`
+in a test or a caller must supply all three; `defaultPolicy(tier)` and `parsePolicy()` already do.
+
+### C-16 · Egress is a proxy-level control and the README says what it does not cover
+Per-server `egress` constrains **what the model can direct a tool to reach**. It does not and
+cannot constrain what a compromised server opens on its own sockets — toolwall reads JSON-RPC
+messages, it does not own the server's network namespace. The F-1 0.995 figure in
+RESEARCH-BRIEF §4.2 comes from observing actual traffic and is **not** a number this control earns.
+That distinction is stated in `src/policy/egress.ts`, in `src/policy/schema.ts`, and in the README
+under both "Egress allowlisting" and "What toolwall does NOT do". Do not let it be dropped from any
+of the four.

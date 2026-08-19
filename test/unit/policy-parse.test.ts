@@ -157,3 +157,77 @@ describe("the shipped example policy parses", () => {
     expect(r.ok).toBe(true);
   });
 });
+
+describe("Week 2 policy blocks: egress, response, confirmation", () => {
+  it("rejects a typo in an egress block rather than silently enforcing nothing", () => {
+    const r = parsePolicy({ version: 1, tier: "balanced", servers: { s: { egress: { hots: ["a.com"] } } } });
+    expect(r.ok).toBe(false);
+    expect(errAt(r)).toContain("/servers/s/egress/hots");
+  });
+
+  it("rejects a substring wildcard in an egress host list", () => {
+    const r = parsePolicy({ version: 1, tier: "balanced", servers: { s: { egress: { hosts: ["*example.com"] } } } });
+    expect(r.ok).toBe(false);
+    expect(errAt(r)).toContain("/servers/s/egress/hosts/0");
+  });
+
+  it("declaring an egress block turns enforcement on without the operator saying so twice", () => {
+    const r = parsePolicy({ version: 1, tier: "balanced", servers: { s: { egress: { hosts: ["a.com"] } } } });
+    if (!r.ok) throw new Error("expected ok");
+    expect(r.policy.egressFor("s")).toMatchObject({ declared: true, enforce: "roles" });
+  });
+
+  it("an undeclared server inherits the global egress block", () => {
+    const r = parsePolicy({ version: 1, tier: "balanced", egress: { hosts: ["a.com"] }, servers: { s: {} } });
+    if (!r.ok) throw new Error("expected ok");
+    expect(r.policy.egressFor("anything").declared).toBe(true);
+    expect(r.policy.egressFor("s").hosts).toEqual(["a.com"]);
+  });
+
+  it("with no egress block anywhere, nothing is enforced at that layer", () => {
+    const r = parsePolicy({ version: 1, tier: "balanced", servers: { s: {} } });
+    if (!r.ok) throw new Error("expected ok");
+    expect(r.policy.egressFor("s")).toMatchObject({ declared: false, enforce: "off" });
+    expect(defaultPolicy("strict").egressFor("s")).toMatchObject({ declared: false, enforce: "off" });
+  });
+
+  it("warns when a declared allowlist is empty, because that denies everything", () => {
+    const r = parsePolicy({ version: 1, tier: "balanced", servers: { s: { egress: { hosts: [] } } } });
+    if (!r.ok) throw new Error("expected ok");
+    expect(r.warnings.some((w) => w.includes("empty host allowlist"))).toBe(true);
+  });
+
+  it("validates the response block and its enum values", () => {
+    const bad = parsePolicy({ version: 1, tier: "balanced", servers: { s: { response: { atpa: "yes" } } } });
+    expect(bad.ok).toBe(false);
+    expect(errAt(bad)).toContain("/servers/s/response/atpa");
+    const good = parsePolicy({ version: 1, tier: "balanced", servers: { s: { response: { atpa: "record", bounds: { maxDepth: 8 } } } } });
+    if (!good.ok) throw new Error("expected ok");
+    expect(good.policy.responseFor("s").atpa).toBe("record");
+    expect(good.policy.responseFor("s").bounds.maxDepth).toBe(8);
+  });
+
+  it("the confirmation budget is session-wide and overridable", () => {
+    const r = parsePolicy({ version: 1, tier: "balanced", confirmation: { maxPrompts: 2 } });
+    if (!r.ok) throw new Error("expected ok");
+    expect(r.policy.confirmation.maxPrompts).toBe(2);
+    expect(r.policy.confirmation.promptableRules.length).toBeGreaterThan(0);
+  });
+
+  it("the shipped toolwall-policy.example.json parses cleanly", () => {
+    const doc = JSON.parse(fs.readFileSync(new URL("../../toolwall-policy.example.json", import.meta.url), "utf8")) as unknown;
+    // A probe that says every declared root exists and nothing is a symlink, so the example file
+    // can be validated without creating /Users/you/projects/my-app on the machine running the test.
+    const r = parsePolicy(doc, {
+      probe: {
+        isSymbolicLink: () => false,
+        readLink: () => {
+          throw new Error("not a link");
+        },
+        exists: () => true,
+      },
+    });
+    if (!r.ok) throw new Error(`example policy does not parse: ${JSON.stringify(r.errors, null, 2)}`);
+    expect(r.policy.egressFor("fetch")).toMatchObject({ declared: true, enforce: "roles" });
+  });
+});

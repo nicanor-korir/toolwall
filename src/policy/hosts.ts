@@ -1,4 +1,14 @@
-import type { NetworkGrant } from "./schema.js";
+/**
+ * The structural shape both `NetworkGrant` (per tool) and `EgressPolicy` (per server) satisfy, so
+ * the same matcher enforces both. They are intersected, never unioned: a per-tool grant may narrow
+ * what the server-level allowlist permits and can never widen it.
+ */
+export interface HostAllowlist {
+  readonly hosts: readonly string[];
+  readonly schemes: readonly string[];
+  readonly allowPrivateNetwork: boolean;
+  readonly allowIpLiterals: boolean;
+}
 
 /**
  * Host and URL capability matching — the egress leg.
@@ -93,7 +103,7 @@ export function isPrivateAddress(hostname: string): boolean {
   return false;
 }
 
-export function evaluateUrl(raw: unknown, grant: NetworkGrant): UrlDecision {
+export function evaluateUrl(raw: unknown, grant: HostAllowlist): UrlDecision {
   if (typeof raw !== "string") return { ok: false, reason: "unparseable", detail: `expected string, got ${typeof raw}` };
 
   let url: URL;
@@ -139,4 +149,60 @@ export function evaluateUrl(raw: unknown, grant: NetworkGrant): UrlDecision {
   }
 
   return { ok: true, hostname, scheme, matchedBy: "wildcard", notes };
+}
+
+/**
+ * Evaluate a BARE host argument — `api.example.com`, `db.internal:5432`, `10.0.0.4` — against the
+ * same allowlist. Used for arguments bound to the `host` role, where the tool supplies the scheme
+ * itself (database, SSH, SMTP, webhook clients) so there is no scheme in the value to check.
+ *
+ * Parsed through the WHATWG URL parser with a synthetic scheme rather than by splitting on `:`,
+ * so that the same normalization applies: IDNA, case folding, `2130706433` -> `127.0.0.1`, and
+ * the `good.com@evil.tld` userinfo confusion resolving to `evil.tld` rather than to `good.com`.
+ */
+export function evaluateHost(raw: unknown, grant: HostAllowlist): UrlDecision {
+  if (typeof raw !== "string") return { ok: false, reason: "unparseable", detail: `expected string, got ${typeof raw}` };
+  const trimmed = raw.trim();
+  if (trimmed === "") return { ok: false, reason: "unparseable", detail: "empty host" };
+  // A value that already carries a scheme is a URL; evaluate it as one so the scheme is checked.
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) return evaluateUrl(trimmed, grant);
+  // `toolwall-host` is a placeholder authority-bearing scheme; the WHATWG parser treats unknown
+  // schemes as "not special", which still populates `hostname` for `scheme://host` input.
+  return evaluateUrl(`toolwall-host://${trimmed}`, { ...grant, schemes: [...grant.schemes, "toolwall-host"] });
+}
+
+/**
+ * Absolute-URL extraction for `enforce: "scan"`.
+ *
+ * Deliberately narrow: it requires `scheme://`, which means it finds the shape that can actually
+ * be dialled and ignores the bare domain names, email addresses and package specifiers that make
+ * up most of the "URL-like" text in a benign argument. It is still the highest-false-positive
+ * thing in this module — a commit message, a code comment or a Jira description legitimately
+ * contains links to hosts nobody allowlisted — which is why `scan` is opt-in at every tier and why
+ * the FP harness measures it separately.
+ */
+const URL_IN_TEXT = /\b([a-z][a-z0-9+.-]{1,31}):\/\/([^\s"'`<>\\)\]}|^]{1,2048})/gi;
+
+/** Schemes worth extracting. `file:`/`data:` have no host and are not an egress destination. */
+const SCANNED_SCHEMES = new Set(["http", "https", "ws", "wss", "ftp", "ftps", "sftp", "ssh", "smtp", "gopher", "ldap", "ldaps"]);
+
+export function extractUrls(text: string, limit = 64): string[] {
+  const out: string[] = [];
+  URL_IN_TEXT.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = URL_IN_TEXT.exec(text)) !== null) {
+    if (out.length >= limit) break;
+    const scheme = (m[1] ?? "").toLowerCase();
+    if (!SCANNED_SCHEMES.has(scheme)) continue;
+    // Trim trailing punctuation that is prose, not URL: "see https://x.dev/a." / "(https://x.dev)"
+    let candidate = m[0];
+    while (candidate.length > 0 && /[.,;:!?'"]$/.test(candidate)) candidate = candidate.slice(0, -1);
+    try {
+      const u = new URL(candidate);
+      if (u.hostname !== "") out.push(candidate);
+    } catch {
+      /* not a URL after all */
+    }
+  }
+  return out;
 }

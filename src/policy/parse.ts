@@ -1,5 +1,9 @@
 import type { ToolDefinition } from "./contract.js";
 import {
+  confirmationPreset,
+  DECLARED_EGRESS_DEFAULT_ENFORCE,
+  egressPreset,
+  responsePreset,
   tierPreset,
   type ArgumentBounds,
   type ArgumentRoles,
@@ -7,6 +11,9 @@ import {
   type FilesystemGrant,
   type GrantOverride,
   type NetworkGrant,
+  type ConfirmationBudget,
+  type EgressPolicy,
+  type ResponsePolicy,
   type SchemaEnforcement,
   type StrictnessTier,
   type ToolwallPolicy,
@@ -36,6 +43,17 @@ export interface ResolvedPolicy {
    * it (which drives the `unknownTool` disposition).
    */
   grantFor(serverId: string, toolName: string): { grant: CapabilityGrant; known: boolean };
+  /**
+   * The per-server egress allowlist. Always returns a value; `declared: false` means the operator
+   * has written no `egress` block, in which case nothing is enforced at this layer and the
+   * per-tool `network` capability rules apply unchanged. Declaring one switches that server to
+   * deny-by-default.
+   */
+  egressFor(serverId: string): EgressPolicy;
+  /** Response-leg controls for this server (T-03). */
+  responseFor(serverId: string): ResponsePolicy;
+  /** The session-wide human-confirmation budget (T-06). */
+  readonly confirmation: ConfirmationBudget;
 }
 
 export type ParseResult = { ok: true; policy: ResolvedPolicy; warnings: readonly string[] } | { ok: false; errors: readonly PolicyError[] };
@@ -78,7 +96,10 @@ const GRANT_KEYS = new Set([
 const FS_KEYS = new Set(["read", "write", "deny", "followSymlinksOutOfRoot", "allowNonexistent"]);
 const NET_KEYS = new Set(["hosts", "schemes", "allowPrivateNetwork", "allowIpLiterals"]);
 const BOUNDS_KEYS = new Set(["maxTotalBytes", "maxStringLength", "maxArrayItems", "maxObjectProperties", "maxDepth"]);
-const ROLES_KEYS = new Set(["readPath", "writePath", "url", "deriveUrlFromSchema"]);
+const ROLES_KEYS = new Set(["readPath", "writePath", "url", "host", "deriveUrlFromSchema"]);
+const EGRESS_KEYS = new Set(["enforce", "hosts", "schemes", "allowPrivateNetwork", "allowIpLiterals", "onViolation"]);
+const RESPONSE_KEYS = new Set(["enabled", "bounds", "outputSchema", "atpa", "inputRequests", "elicitation"]);
+const CONFIRMATION_KEYS = new Set(["maxPrompts", "timeoutMs", "promptableRules"]);
 const SCHEMA_KEYS = new Set(["enabled", "additionalProperties", "requireKnownSchema", "maxPatternLength", "enforceFormats"]);
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -145,18 +166,7 @@ function validateGrant(v: unknown, at: string, errors: PolicyError[]): void {
       checkStringArray(net["schemes"], `${at}/network/schemes`, errors);
       checkBool(net["allowPrivateNetwork"], `${at}/network/allowPrivateNetwork`, errors);
       checkBool(net["allowIpLiterals"], `${at}/network/allowIpLiterals`, errors);
-      const hosts = net["hosts"];
-      if (Array.isArray(hosts)) {
-        for (const [i, h] of hosts.entries()) {
-          if (typeof h !== "string") continue;
-          if (h.includes("*") && !h.startsWith("*.")) {
-            errors.push({
-              at: `${at}/network/hosts/${i}`,
-              message: `"${h}": the only supported wildcard form is "*.example.com". Substring wildcards are not supported because they are how host allowlists get bypassed.`,
-            });
-          }
-        }
-      }
+      checkHostList(net["hosts"], `${at}/network/hosts`, errors);
     }
   }
 
@@ -180,7 +190,7 @@ function validateGrant(v: unknown, at: string, errors: PolicyError[]): void {
     if (!isPlainObject(roles)) errors.push({ at: `${at}/roles`, message: "expected an object" });
     else {
       checkKeys(roles, ROLES_KEYS, `${at}/roles`, errors);
-      for (const k of ["readPath", "writePath", "url"] as const) {
+      for (const k of ["readPath", "writePath", "url", "host"] as const) {
         checkStringArray(roles[k], `${at}/roles/${k}`, errors);
         const arr = roles[k];
         if (Array.isArray(arr)) {
@@ -207,6 +217,66 @@ function validateGrant(v: unknown, at: string, errors: PolicyError[]): void {
       checkStringArray(sch["enforceFormats"], `${at}/schema/enforceFormats`, errors);
     }
   }
+}
+
+/** Shared host-list validation: the only supported wildcard is a leading `*.`. */
+function checkHostList(hosts: unknown, at: string, errors: PolicyError[]): void {
+  if (!Array.isArray(hosts)) return;
+  for (const [i, h] of hosts.entries()) {
+    if (typeof h !== "string") continue;
+    if (h.includes("*") && !h.startsWith("*.")) {
+      errors.push({
+        at: `${at}/${i}`,
+        message: `"${h}": the only supported wildcard form is "*.example.com". Substring wildcards are not supported because they are how host allowlists get bypassed.`,
+      });
+    }
+  }
+}
+
+function validateEgress(v: unknown, at: string, errors: PolicyError[]): void {
+  if (!isPlainObject(v)) {
+    errors.push({ at, message: "expected an object" });
+    return;
+  }
+  checkKeys(v, EGRESS_KEYS, at, errors);
+  checkEnum(v["enforce"], ["off", "roles", "scan"], `${at}/enforce`, errors);
+  checkStringArray(v["hosts"], `${at}/hosts`, errors);
+  checkStringArray(v["schemes"], `${at}/schemes`, errors);
+  checkBool(v["allowPrivateNetwork"], `${at}/allowPrivateNetwork`, errors);
+  checkBool(v["allowIpLiterals"], `${at}/allowIpLiterals`, errors);
+  checkEnum(v["onViolation"], ["block", "confirm", "allow"], `${at}/onViolation`, errors);
+  checkHostList(v["hosts"], `${at}/hosts`, errors);
+}
+
+function validateResponse(v: unknown, at: string, errors: PolicyError[]): void {
+  if (!isPlainObject(v)) {
+    errors.push({ at, message: "expected an object" });
+    return;
+  }
+  checkKeys(v, RESPONSE_KEYS, at, errors);
+  checkBool(v["enabled"], `${at}/enabled`, errors);
+  for (const k of ["outputSchema", "atpa", "inputRequests", "elicitation"] as const) {
+    checkEnum(v[k], ["enforce", "record", "off"], `${at}/${k}`, errors);
+  }
+  const bounds = v["bounds"];
+  if (bounds !== undefined) {
+    if (!isPlainObject(bounds)) errors.push({ at: `${at}/bounds`, message: "expected an object" });
+    else {
+      checkKeys(bounds, BOUNDS_KEYS, `${at}/bounds`, errors);
+      for (const k of BOUNDS_KEYS) checkPositiveInt(bounds[k], `${at}/bounds/${k}`, errors);
+    }
+  }
+}
+
+function validateConfirmation(v: unknown, at: string, errors: PolicyError[]): void {
+  if (!isPlainObject(v)) {
+    errors.push({ at, message: "expected an object" });
+    return;
+  }
+  checkKeys(v, CONFIRMATION_KEYS, at, errors);
+  checkPositiveInt(v["maxPrompts"], `${at}/maxPrompts`, errors);
+  checkPositiveInt(v["timeoutMs"], `${at}/timeoutMs`, errors);
+  checkStringArray(v["promptableRules"], `${at}/promptableRules`, errors);
 }
 
 /* ---------------------------------------------------------------- */
@@ -252,6 +322,28 @@ function mergeGrant(base: CapabilityGrant, o: GrantOverride | undefined): Capabi
   };
 }
 
+/**
+ * Merging a declared `egress` block sets `declared: true` and, unless the operator said otherwise,
+ * turns enforcement on at `"roles"`. Writing the block IS the act of opting in to deny-by-default;
+ * a block that parsed but enforced nothing would be the silent-no-op failure mode this parser
+ * exists to prevent.
+ */
+function mergeEgress(base: EgressPolicy, o: Partial<EgressPolicy> | undefined): EgressPolicy {
+  if (o === undefined) return base;
+  const declared = true;
+  return {
+    ...base,
+    ...o,
+    declared,
+    enforce: o.enforce ?? (base.declared ? base.enforce : DECLARED_EGRESS_DEFAULT_ENFORCE),
+  };
+}
+
+function mergeResponse(base: ResponsePolicy, o: Partial<ResponsePolicy> | undefined): ResponsePolicy {
+  if (o === undefined) return base;
+  return { ...base, ...o, bounds: mergeBounds(base.bounds, o.bounds as Partial<ArgumentBounds> | undefined) };
+}
+
 /** Canonicalize declared roots once, at load time. Symlinked roots must not surprise us later. */
 function canonicalizeGrantRoots(g: CapabilityGrant, at: string, probe: FsProbe, errors: PolicyError[]): CapabilityGrant {
   if (g.filesystem === undefined) return g;
@@ -289,7 +381,7 @@ export function parsePolicy(raw: unknown, opts: ParseOptions = {}): ParseResult 
   const probe = opts.probe ?? nodeFsProbe;
 
   if (!isPlainObject(raw)) return { ok: false, errors: [{ at: "", message: "policy must be a JSON object" }] };
-  checkKeys(raw, new Set(["$schema", "version", "tier", "defaults", "servers"]), "", errors);
+  checkKeys(raw, new Set(["$schema", "version", "tier", "defaults", "egress", "response", "confirmation", "servers"]), "", errors);
 
   if (raw["version"] !== 1) errors.push({ at: "/version", message: 'expected "version": 1' });
   const tierRaw = raw["tier"] ?? "balanced";
@@ -297,6 +389,9 @@ export function parsePolicy(raw: unknown, opts: ParseOptions = {}): ParseResult 
   const tier = (typeof tierRaw === "string" ? tierRaw : "balanced") as StrictnessTier;
 
   if (raw["defaults"] !== undefined) validateGrant(raw["defaults"], "/defaults", errors);
+  if (raw["egress"] !== undefined) validateEgress(raw["egress"], "/egress", errors);
+  if (raw["response"] !== undefined) validateResponse(raw["response"], "/response", errors);
+  if (raw["confirmation"] !== undefined) validateConfirmation(raw["confirmation"], "/confirmation", errors);
 
   const serversRaw = raw["servers"];
   if (serversRaw !== undefined && !isPlainObject(serversRaw)) {
@@ -308,8 +403,10 @@ export function parsePolicy(raw: unknown, opts: ParseOptions = {}): ParseResult 
         errors.push({ at: `/servers/${sid}`, message: "expected an object" });
         continue;
       }
-      checkKeys(sp, new Set(["defaults", "tools"]), `/servers/${sid}`, errors);
+      checkKeys(sp, new Set(["defaults", "tools", "egress", "response"]), `/servers/${sid}`, errors);
       if (sp["defaults"] !== undefined) validateGrant(sp["defaults"], `/servers/${sid}/defaults`, errors);
+      if (sp["egress"] !== undefined) validateEgress(sp["egress"], `/servers/${sid}/egress`, errors);
+      if (sp["response"] !== undefined) validateResponse(sp["response"], `/servers/${sid}/response`, errors);
       const tools = sp["tools"];
       if (tools !== undefined && !isPlainObject(tools)) errors.push({ at: `/servers/${sid}/tools`, message: "expected an object keyed by tool name" });
       if (isPlainObject(tools)) {
@@ -324,13 +421,21 @@ export function parsePolicy(raw: unknown, opts: ParseOptions = {}): ParseResult 
   const base = mergeGrant(tierPreset(tier), doc.defaults);
   const globalGrant = canonicalizeGrantRoots(base, "/defaults", probe, errors);
 
+  const globalEgress = mergeEgress(egressPreset(tier), doc.egress as Partial<EgressPolicy> | undefined);
+  const globalResponse = mergeResponse(responsePreset(tier), doc.response as Partial<ResponsePolicy> | undefined);
+  const confirmation: ConfirmationBudget = { ...confirmationPreset(tier), ...(doc.confirmation as Partial<ConfirmationBudget> | undefined) };
+
   const perServer = new Map<string, CapabilityGrant>();
   const perTool = new Map<string, CapabilityGrant>();
   const knownTools = new Set<string>();
+  const perServerEgress = new Map<string, EgressPolicy>();
+  const perServerResponse = new Map<string, ResponsePolicy>();
 
   for (const [sid, sp] of Object.entries(doc.servers ?? {})) {
     const sGrant = canonicalizeGrantRoots(mergeGrant(globalGrant, sp.defaults), `/servers/${sid}/defaults`, probe, errors);
     perServer.set(sid, sGrant);
+    perServerEgress.set(sid, mergeEgress(globalEgress, sp.egress as Partial<EgressPolicy> | undefined));
+    perServerResponse.set(sid, mergeResponse(globalResponse, sp.response as Partial<ResponsePolicy> | undefined));
     for (const [tn, tg] of Object.entries(sp.tools ?? {})) {
       const key = `${sid} ${tn}`;
       perTool.set(key, canonicalizeGrantRoots(mergeGrant(sGrant, tg), `/servers/${sid}/tools/${tn}`, probe, errors));
@@ -346,8 +451,26 @@ export function parsePolicy(raw: unknown, opts: ParseOptions = {}): ParseResult 
     );
   }
 
+  // A declared-but-empty allowlist denies every destination. That is a legitimate posture ("this
+  // server talks to nothing") and it is also what a truncated edit looks like, so say so out loud
+  // rather than letting the operator discover it as an outage.
+  for (const [sid, e] of perServerEgress) {
+    if (e.declared && e.enforce !== "off" && e.hosts.length === 0) {
+      warnings.push(`servers["${sid}"].egress declares an empty host allowlist: every URL or host argument on this server will be denied.`);
+    }
+  }
+  for (const e of [globalEgress, ...perServerEgress.values()]) {
+    if (e.enforce === "scan") {
+      warnings.push(
+        'egress.enforce = "scan" inspects every string argument for URLs, not only the ones bound to a role. It catches destinations hidden in free-text fields and it has a measured false-positive cost on content-carrying tools - see the FP report before leaving it on.',
+      );
+      break;
+    }
+  }
+
   const policy: ResolvedPolicy = {
     tier,
+    confirmation,
     grantFor(serverId, toolName) {
       const key = `${serverId} ${toolName}`;
       const t = perTool.get(key);
@@ -355,6 +478,12 @@ export function parsePolicy(raw: unknown, opts: ParseOptions = {}): ParseResult 
       const s = perServer.get(serverId);
       if (s) return { grant: s, known: false };
       return { grant: globalGrant, known: false };
+    },
+    egressFor(serverId) {
+      return perServerEgress.get(serverId) ?? globalEgress;
+    },
+    responseFor(serverId) {
+      return perServerResponse.get(serverId) ?? globalResponse;
     },
   };
 
@@ -364,10 +493,19 @@ export function parsePolicy(raw: unknown, opts: ParseOptions = {}): ParseResult 
 /** The policy in force when the operator has written no `toolwall-policy.json` at all. */
 export function defaultPolicy(tier: StrictnessTier = "balanced"): ResolvedPolicy {
   const grant = tierPreset(tier);
+  const egress = egressPreset(tier);
+  const response = responsePreset(tier);
   return {
     tier,
+    confirmation: confirmationPreset(tier),
     grantFor() {
       return { grant, known: false };
+    },
+    egressFor() {
+      return egress;
+    },
+    responseFor() {
+      return response;
     },
   };
 }

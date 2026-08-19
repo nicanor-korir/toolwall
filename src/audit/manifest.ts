@@ -1,9 +1,11 @@
 /**
  * The pin store — toolwall's security state.
  *
- * A pin binds `(serverId, kind, subject)` to the SHA-256 of the RFC 8785 canonical form of a
- * tool definition (or of a server's `instructions`), together with the decision that approved
- * it. It is the entire basis for the rug-pull claim, so this file is written as security state,
+ * A pin binds `(serverId, scope, kind, subject)` to the SHA-256 of the RFC 8785 canonical form of
+ * a tool definition (or of a server's `instructions`), together with the decision that approved
+ * it. `scope` is the authorization context the listing was obtained under — see {@link PinScope}
+ * for why it is part of the key and not metadata hanging off it.
+ * It is the entire basis for the rug-pull claim, so this file is written as security state,
  * not as a cache: restrictive permissions, atomic replacement, integrity self-check on load,
  * fail-closed on anything unexpected, and **no code path anywhere that silently accepts a
  * changed hash.**
@@ -41,8 +43,125 @@ import type { PinKind } from "../guards/metadata/surface.js";
 import type { ProtocolEra } from "../types/protocol.js";
 
 export const PIN_FILE_FORMAT = "toolwall/pins";
-export const PIN_FILE_SCHEMA_VERSION = 1;
+/**
+ * Bumped 1 -> 2 in week 2 when `scope` entered the pin key (see {@link PinScope}). A v1 file is
+ * still readable: every record in it is adopted at {@link DEFAULT_PIN_SCOPE}, which is exactly what
+ * it meant before the field existed. Writing always produces v2.
+ */
+export const PIN_FILE_SCHEMA_VERSION = 2;
+/** Schema versions this build can read. Writing is always at {@link PIN_FILE_SCHEMA_VERSION}. */
+export const READABLE_PIN_FILE_SCHEMA_VERSIONS: readonly number[] = [1, 2];
 export const DEFAULT_PIN_FILE = ".toolwall/pins.json";
+
+// ---------------------------------------------------------------------------
+// Authorization scope (RESEARCH-BRIEF §4.5 item 6)
+// ---------------------------------------------------------------------------
+
+/**
+ * The authorization context a listing was obtained under.
+ *
+ * ## Why the pin key needs this
+ *
+ * `2026-07-28` says `tools/list` **MUST NOT** vary per-connection but **MAY vary by the
+ * authorization presented**. Those two clauses together are what makes a scope-blind pin store
+ * wrong rather than merely incomplete: the same server, reached with a narrower token, legitimately
+ * returns fewer tools and narrower schemas — and against a single-key pin store every one of those
+ * differences is a hash mismatch. The operator gets a critical rug-pull alarm for doing the exact
+ * thing security advice tells them to do, which is the fastest way to teach someone to ignore
+ * rug-pull alarms. `docs/RESEARCH-BRIEF.md` §4.3: human confirmation is a **13.6%** control at
+ * best, and it goes to zero once the alarms are known to be wrong.
+ *
+ * So a pin is keyed by `(serverId, scope, kind, subject)`. Under a different credential the same
+ * tool is a *different pin*, adopted on its own first sighting, and narrowing scope produces new
+ * pins rather than drift on old ones.
+ *
+ * ## What may go into a scope id — and what may never
+ *
+ * **Structure is identity, secrets are not.** This is the same rule `src/audit/identity.ts` applies
+ * to `serverId`, and it applies here for a stronger reason: the pin file is long-lived security
+ * state that gets committed, backed up and copied between machines. A token value, or a hash of
+ * one, has no business in it.
+ *
+ * Therefore {@link deriveScopeId} accepts only non-secret descriptors — issuer, subject, client id,
+ * audience, granted scope *names*, and an operator-chosen label — and there is deliberately no
+ * overload that takes a raw credential. If all you have is an opaque bearer token, name it
+ * yourself via `label`. A caller who wants scope keying must be able to say what the scope *is*,
+ * and if they cannot, keying on it would not be meaningful anyway.
+ */
+export type PinScope = string;
+
+/**
+ * The scope every pin lives at when no authorization context is supplied: a single-credential
+ * connection, which is what stdio always is and what most HTTP setups are. Empty string so a v1
+ * pin file migrates to it with no transformation.
+ */
+export const DEFAULT_PIN_SCOPE: PinScope = "";
+
+/**
+ * Non-secret facts identifying an authorization context. Every field is optional; whichever are
+ * present contribute, in a fixed order, so the same context always yields the same id.
+ */
+export interface ScopeDescriptor {
+  /** OAuth issuer / IdP, e.g. `"https://login.example.com"`. */
+  readonly issuer?: string;
+  /** Subject or principal identifier. A user id, not a token. */
+  readonly subject?: string;
+  /** OAuth client id. Public by definition. */
+  readonly clientId?: string;
+  /** Resource indicator / audience the credential is bound to. */
+  readonly audience?: string;
+  /** Granted scope NAMES, e.g. `["repo:read", "issues:write"]`. Order-insensitive. */
+  readonly scopes?: readonly string[];
+  /** Free-form operator label, for credentials that carry no claims worth keying on. */
+  readonly label?: string;
+}
+
+/** Keys hashed into a scope id, in a fixed order. */
+const SCOPE_FIELDS = ["issuer", "subject", "clientId", "audience", "label"] as const;
+
+/**
+ * Derive a stable, non-secret scope id. Returns {@link DEFAULT_PIN_SCOPE} for an empty descriptor,
+ * so callers with no authorization context need no special case.
+ *
+ * @throws when a field looks like a credential rather than an identifier. The check is a coarse
+ *   shape heuristic (JWT-shaped, or a long high-entropy opaque string) and it is deliberately
+ *   noisy-in-the-safe-direction: refusing a legitimate but odd-looking label costs an operator one
+ *   config edit, while accepting a token writes it into a file that outlives the session.
+ */
+export function deriveScopeId(descriptor: ScopeDescriptor): PinScope {
+  const parts: string[] = [];
+  for (const field of SCOPE_FIELDS) {
+    const value = descriptor[field];
+    if (value === undefined || value === "") continue;
+    assertNotCredentialShaped(field, value);
+    parts.push(`${field}=${value}`);
+  }
+  if (descriptor.scopes !== undefined && descriptor.scopes.length > 0) {
+    for (const s of descriptor.scopes) assertNotCredentialShaped("scopes", s);
+    // Sorted: the grant is a set, and a server returning the same grant in a different order is
+    // not a different authorization context.
+    parts.push(`scopes=${[...descriptor.scopes].sort().join(",")}`);
+  }
+  if (parts.length === 0) return DEFAULT_PIN_SCOPE;
+  const digest = createHash("sha256").update(parts.join(" "), "utf8").digest("hex");
+  return `scope_${digest.slice(0, 16)}`;
+}
+
+/** JWT shape: three base64url segments. Unmistakable, and unmistakably a credential. */
+const JWT_SHAPED = /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/;
+/** A long run of credential-alphabet characters with no structure a human would write. */
+const OPAQUE_SECRET_SHAPED = /^[A-Za-z0-9_\-+/=]{40,}$/;
+
+function assertNotCredentialShaped(field: string, value: string): void {
+  if (JWT_SHAPED.test(value) || OPAQUE_SECRET_SHAPED.test(value)) {
+    throw new Error(
+      `ScopeDescriptor.${field} looks like a credential, not an identifier. Scope ids are derived ` +
+        "from non-secret structure only — issuer, subject, client id, audience, granted scope " +
+        "names, or an operator-chosen label. Never pass a token, even hashed: the pin file " +
+        "outlives the session and gets copied around.",
+    );
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Server identity (T-04)
@@ -81,6 +200,11 @@ export interface PinDecision {
 
 export interface PinRecord {
   readonly serverId: string;
+  /**
+   * The authorization context this pin was observed under. {@link DEFAULT_PIN_SCOPE} when there is
+   * none. Part of the key: see {@link PinScope} for why.
+   */
+  readonly scope: PinScope;
   readonly kind: PinKind;
   /** Tool name, or `"instructions"` for a server-level pin. */
   readonly subject: string;
@@ -110,6 +234,8 @@ export interface SupersededPin {
 
 export interface PinInput {
   readonly serverId: string;
+  /** Authorization context. Defaults to {@link DEFAULT_PIN_SCOPE}. */
+  readonly scope?: PinScope;
   readonly kind: PinKind;
   readonly subject: string;
   readonly era: ProtocolEra;
@@ -125,9 +251,9 @@ export class PinConflictError extends Error {
   readonly attemptedHash: string;
   constructor(existing: PinRecord, attemptedHash: string) {
     super(
-      `a pin already exists for ${existing.serverId}/${existing.kind}:${existing.subject} with a ` +
-        `different hash (pinned ${existing.hash}, attempted ${attemptedHash}). Changing a pin ` +
-        "requires approveDrift() and an explicit human decision.",
+      `a pin already exists for ${describeKey(existing.serverId, existing.scope, existing.kind, existing.subject)} ` +
+        `with a different hash (pinned ${existing.hash}, attempted ${attemptedHash}). Changing a ` +
+        "pin requires approveDrift() and an explicit human decision.",
     );
     this.existing = existing;
     this.attemptedHash = attemptedHash;
@@ -192,12 +318,21 @@ export interface IntegrityStatus {
 export interface PinFilter {
   readonly serverId?: string;
   readonly kind?: PinKind;
+  /** Restrict to one authorization context. Omit to list across every scope. */
+  readonly scope?: PinScope;
 }
 
-function mapKey(serverId: string, kind: PinKind, subject: string): string {
-  // NUL cannot occur in a tool name and cannot be produced by a serverId, so the key is
-  // unambiguous under concatenation.
-  return `${serverId}\u0000${kind}\u0000${subject}`;
+/** Human-readable key, for messages an operator reads. */
+function describeKey(serverId: string, scope: PinScope, kind: PinKind, subject: string): string {
+  return scope === DEFAULT_PIN_SCOPE
+    ? `${serverId}/${kind}:${subject}`
+    : `${serverId}@${scope}/${kind}:${subject}`;
+}
+
+function mapKey(serverId: string, scope: PinScope, kind: PinKind, subject: string): string {
+  // NUL cannot occur in a tool name, a scope id or a serverId, so the key is unambiguous
+  // under concatenation.
+  return `${serverId}\u0000${scope}\u0000${kind}\u0000${subject}`;
 }
 
 export class PinStore {
@@ -262,11 +397,25 @@ export class PinStore {
         `unexpected format ${JSON.stringify(parsed["format"])}, expected ${PIN_FILE_FORMAT}`,
       );
     }
-    if (parsed["schemaVersion"] !== PIN_FILE_SCHEMA_VERSION) {
+    const schemaVersion = parsed["schemaVersion"];
+    if (
+      typeof schemaVersion !== "number" ||
+      !READABLE_PIN_FILE_SCHEMA_VERSIONS.includes(schemaVersion)
+    ) {
       throw new PinStoreIntegrityError(
         path,
-        `pin file schemaVersion ${String(parsed["schemaVersion"])} is not supported by this ` +
-          `build (expected ${PIN_FILE_SCHEMA_VERSION})`,
+        `pin file schemaVersion ${String(schemaVersion)} is not supported by this build ` +
+          `(readable: ${READABLE_PIN_FILE_SCHEMA_VERSIONS.join(", ")}; written: ${PIN_FILE_SCHEMA_VERSION})`,
+      );
+    }
+    if (schemaVersion < PIN_FILE_SCHEMA_VERSION) {
+      // Migration is read-only and lossless: v1 had no `scope`, and "no scope" is exactly
+      // DEFAULT_PIN_SCOPE. Nothing is rewritten on disk until the caller flushes, and the
+      // integrity digest below is still checked against the v1 bytes as they were written.
+      warnings.push(
+        `pin file is schemaVersion ${schemaVersion}; its pins were adopted at the default ` +
+          `authorization scope and the file will be rewritten as v${PIN_FILE_SCHEMA_VERSION} on ` +
+          "the next flush",
       );
     }
 
@@ -294,7 +443,7 @@ export class PinStore {
     if (!Array.isArray(rawPins)) throw new PinStoreIntegrityError(path, "`pins` is not an array");
     for (const entry of rawPins) {
       const record = coercePinRecord(entry, path);
-      pins.set(mapKey(record.serverId, record.kind, record.subject), record);
+      pins.set(mapKey(record.serverId, record.scope, record.kind, record.subject), record);
     }
 
     const revision = typeof parsed["revision"] === "number" ? parsed["revision"] : 0;
@@ -330,12 +479,46 @@ export class PinStore {
     return this.#pins.size;
   }
 
-  get(serverId: string, kind: PinKind, subject: string): PinRecord | undefined {
-    return this.#pins.get(mapKey(serverId, kind, subject));
+  /**
+   * `scope` defaults to {@link DEFAULT_PIN_SCOPE}, so a caller with no authorization context — every
+   * stdio connection, most HTTP ones — reads and writes exactly the pins it did before scope
+   * existed. The parameter is last and optional for that reason: adding scope keying must not
+   * silently change the meaning of an existing call site.
+   */
+  get(
+    serverId: string,
+    kind: PinKind,
+    subject: string,
+    scope: PinScope = DEFAULT_PIN_SCOPE,
+  ): PinRecord | undefined {
+    return this.#pins.get(mapKey(serverId, scope, kind, subject));
   }
 
-  has(serverId: string, kind: PinKind, subject: string): boolean {
-    return this.#pins.has(mapKey(serverId, kind, subject));
+  has(
+    serverId: string,
+    kind: PinKind,
+    subject: string,
+    scope: PinScope = DEFAULT_PIN_SCOPE,
+  ): boolean {
+    return this.#pins.has(mapKey(serverId, scope, kind, subject));
+  }
+
+  /**
+   * Every pin for one subject, across all authorization scopes.
+   *
+   * This is what makes a scope-related drift alert legible instead of alarming. When a definition
+   * fails to match its pin, the useful question is whether the *same bytes* are already pinned
+   * under a different credential — if they are, what the operator is looking at is an
+   * authorization change, not tampering, and the drift report says so.
+   */
+  listForSubject(serverId: string, kind: PinKind, subject: string): PinRecord[] {
+    const out: PinRecord[] = [];
+    for (const record of this.#pins.values()) {
+      if (record.serverId === serverId && record.kind === kind && record.subject === subject) {
+        out.push(record);
+      }
+    }
+    return out.sort((a, b) => a.scope.localeCompare(b.scope));
   }
 
   list(filter: PinFilter = {}): PinRecord[] {
@@ -343,11 +526,13 @@ export class PinStore {
     for (const record of this.#pins.values()) {
       if (filter.serverId !== undefined && record.serverId !== filter.serverId) continue;
       if (filter.kind !== undefined && record.kind !== filter.kind) continue;
+      if (filter.scope !== undefined && record.scope !== filter.scope) continue;
       out.push(record);
     }
     return out.sort(
       (a, b) =>
         a.serverId.localeCompare(b.serverId) ||
+        a.scope.localeCompare(b.scope) ||
         a.kind.localeCompare(b.kind) ||
         a.subject.localeCompare(b.subject),
     );
@@ -358,7 +543,8 @@ export class PinStore {
    * Re-pinning an identical hash is a no-op and returns the existing record.
    */
   pin(input: PinInput): PinRecord {
-    const key = mapKey(input.serverId, input.kind, input.subject);
+    const scope = input.scope ?? DEFAULT_PIN_SCOPE;
+    const key = mapKey(input.serverId, scope, input.kind, input.subject);
     const existing = this.#pins.get(key);
     if (existing !== undefined) {
       if (existing.hash !== input.hash) throw new PinConflictError(existing, input.hash);
@@ -367,6 +553,7 @@ export class PinStore {
     const at = input.decision.at;
     const record: PinRecord = {
       serverId: input.serverId,
+      scope,
       kind: input.kind,
       subject: input.subject,
       era: input.era,
@@ -385,7 +572,9 @@ export class PinStore {
 
   /** Trust-on-first-use: pin only if nothing is pinned yet. Never overwrites, never throws on conflict. */
   pinIfAbsent(input: PinInput): { created: boolean; record: PinRecord } {
-    const existing = this.#pins.get(mapKey(input.serverId, input.kind, input.subject));
+    const existing = this.#pins.get(
+      mapKey(input.serverId, input.scope ?? DEFAULT_PIN_SCOPE, input.kind, input.subject),
+    );
     if (existing !== undefined) return { created: false, record: existing };
     return { created: true, record: this.pin(input) };
   }
@@ -399,12 +588,13 @@ export class PinStore {
    *   made to look like a first-time pin.
    */
   approveDrift(input: PinInput): PinRecord {
-    const key = mapKey(input.serverId, input.kind, input.subject);
+    const scope = input.scope ?? DEFAULT_PIN_SCOPE;
+    const key = mapKey(input.serverId, scope, input.kind, input.subject);
     const existing = this.#pins.get(key);
     if (existing === undefined) {
       throw new Error(
-        `no existing pin for ${input.serverId}/${input.kind}:${input.subject}; use pin() to ` +
-          "create one",
+        `no existing pin for ${describeKey(input.serverId, scope, input.kind, input.subject)}; ` +
+          "use pin() to create one",
       );
     }
     if (input.decision.kind !== "drift-re-approval") {
@@ -427,6 +617,7 @@ export class PinStore {
     };
     const record: PinRecord = {
       serverId: existing.serverId,
+      scope: existing.scope,
       kind: existing.kind,
       subject: existing.subject,
       era: input.era,
@@ -448,8 +639,14 @@ export class PinStore {
    * memory only; the timestamp reaches disk on the next `flush()`. Marking verified can never
    * change a hash.
    */
-  markVerified(serverId: string, kind: PinKind, subject: string, at?: Date): boolean {
-    const key = mapKey(serverId, kind, subject);
+  markVerified(
+    serverId: string,
+    kind: PinKind,
+    subject: string,
+    at?: Date,
+    scope: PinScope = DEFAULT_PIN_SCOPE,
+  ): boolean {
+    const key = mapKey(serverId, scope, kind, subject);
     const existing = this.#pins.get(key);
     if (existing === undefined) return false;
     this.#pins.set(key, { ...existing, lastVerified: (at ?? this.#now()).toISOString() });
@@ -457,8 +654,13 @@ export class PinStore {
     return true;
   }
 
-  remove(serverId: string, kind: PinKind, subject: string): boolean {
-    const removed = this.#pins.delete(mapKey(serverId, kind, subject));
+  remove(
+    serverId: string,
+    kind: PinKind,
+    subject: string,
+    scope: PinScope = DEFAULT_PIN_SCOPE,
+  ): boolean {
+    const removed = this.#pins.delete(mapKey(serverId, scope, kind, subject));
     if (removed) this.#dirty = true;
     return removed;
   }
@@ -559,8 +761,16 @@ function coercePinRecord(entry: unknown, path: string): PinRecord {
     throw new PinStoreIntegrityError(path, "a pin entry has no usable `decision`");
   }
   const history = entry["history"];
+  // v1 records have no `scope`. Absent means "no authorization context", which is exactly
+  // DEFAULT_PIN_SCOPE, so the migration is the default and needs no rewrite. A `scope` that is
+  // present but not a string is a corrupt record, not a v1 one, and fails closed.
+  const rawScope = entry["scope"];
+  if (rawScope !== undefined && typeof rawScope !== "string") {
+    throw new PinStoreIntegrityError(path, "a pin entry has a non-string `scope`");
+  }
   return {
     serverId: entry["serverId"] as string,
+    scope: rawScope ?? DEFAULT_PIN_SCOPE,
     kind,
     subject: entry["subject"] as string,
     era: entry["era"] as ProtocolEra,

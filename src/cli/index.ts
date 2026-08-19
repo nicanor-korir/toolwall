@@ -24,6 +24,7 @@ import { AuditLog } from '../audit/log.js';
 import { PinStore, PinStoreIntegrityError } from '../audit/manifest.js';
 import { defaultPolicy, parsePolicy, type ResolvedPolicy } from '../policy/parse.js';
 import { SpawnPolicyError, describeInheritedEnvironment, type SpawnSpec } from '../transport/spawn.js';
+import { totalBackoffMs } from '../transport/reconnect.js';
 import type { ProxyEvent } from '../transport/proxy.js';
 
 const VERSION = '0.0.0';
@@ -133,6 +134,19 @@ export async function main(argv: readonly string[]): Promise<number> {
             pinMode: opts.pinMode,
             onUnverifiable: opts.onUnverifiable,
             baseDir: storeCwd,
+            reconnect: {
+                enabled: opts.reconnect,
+                maxAttempts: opts.reconnectAttempts,
+                replayInFlight: opts.replayInFlight
+            },
+            // A reconnect spawns a NEW child with a NEW stderr pipe. Without
+            // re-attaching here the server's diagnostics would go silent after
+            // the first restart, which is exactly when an operator wants them.
+            onUpstreamTransport: transport => {
+                transport.stderr?.on('data', (chunk: Buffer | string) => {
+                    process.stderr.write(chunk);
+                });
+            },
             ...(opts.serverId !== undefined ? { serverId: opts.serverId } : {}),
             ...(opts.noGuards ? { enable: { pinning: false, schema: false, capability: false } } : {}),
             onEvent: (event: ProxyEvent) => reportEvent(event, opts.verbose)
@@ -162,6 +176,12 @@ export async function main(argv: readonly string[]): Promise<number> {
             `toolwall: guards=[${toolwall.registeredGuards.join(',')}] tier=${loaded.policy.tier} pin-mode=${opts.pinMode} on-unverifiable=${opts.onUnverifiable} pins=${pins.path} (${pins.size} pinned)`
         );
     }
+    const reconnect = toolwall.proxy.reconnectPolicy;
+    err(
+        reconnect.enabled
+            ? `toolwall: reconnect=on attempts=${reconnect.maxAttempts} over ~${totalBackoffMs(reconnect)}ms buffer<=${reconnect.maxBufferedRequests} replay-in-flight=${reconnect.replayInFlight} reverify=${reconnect.reverifyOnReconnect}`
+            : 'toolwall: reconnect=off; an upstream blip ends the client session.'
+    );
     if (opts.verbose) {
         err(`toolwall: env inherited from SDK defaults: [${env.sdkDefaults.join(',')}]`);
         err(`toolwall: env explicitly passed through: [${env.passthrough.join(',')}]`);
@@ -172,10 +192,8 @@ export async function main(argv: readonly string[]): Promise<number> {
     }
 
     // The child's stderr is piped, not inherited, so it can never contaminate
-    // our stdout. Relay it verbatim to ours.
-    toolwall.upstreamTransport.stderr?.on('data', (chunk: Buffer | string) => {
-        process.stderr.write(chunk);
-    });
+    // our stdout; `onUpstreamTransport` above relays it verbatim to ours, for
+    // the first process and for every replacement a reconnect spawns.
 
     const shutdown = (): void => {
         void persist(toolwall)
@@ -285,6 +303,35 @@ function reportEvent(event: ProxyEvent, verbose: boolean): void {
             if (verbose) {
                 err('toolwall: client connection closed');
             }
+            break;
+        case 'upstream-reconnecting':
+            err(
+                `toolwall: upstream connection lost; reconnect attempt ${event.attempt}/${event.maxAttempts}, ` +
+                    `${event.buffered} request${event.buffered === 1 ? '' : 's'} buffered`
+            );
+            break;
+        case 'upstream-reconnected':
+            err(
+                `toolwall: upstream reconnected after ${event.downtimeMs}ms on attempt ${event.attempt}; ` +
+                    `re-verified against the pin store, releasing ${event.released} buffered request${event.released === 1 ? '' : 's'}`
+            );
+            break;
+        case 'upstream-reconnect-refused':
+            // Loud unconditionally. This is the rug pull arriving through a restart.
+            err(
+                'toolwall: REFUSED to resume. The upstream MCP server restarted and no longer matches what was approved, ' +
+                    `so ${event.buffered} buffered request${event.buffered === 1 ? ' was' : 's were'} failed rather than released.`
+            );
+            for (const f of event.findings) {
+                err(`toolwall:   [${f.severity}] ${f.ruleId} at ${f.locus || '<payload>'}: ${f.message}`);
+                err(`toolwall:   -> ${f.remediation}`);
+            }
+            break;
+        case 'upstream-reconnect-failed':
+            err(
+                `toolwall: upstream unreachable after ${event.attempts} attempts (${event.error.message}); ` +
+                    `${event.buffered} buffered request${event.buffered === 1 ? '' : 's'} answered with -32603`
+            );
             break;
         default: {
             const exhaustive: never = event;

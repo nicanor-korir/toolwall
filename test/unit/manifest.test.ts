@@ -20,10 +20,13 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  DEFAULT_PIN_SCOPE,
   PIN_FILE_FORMAT,
+  PIN_FILE_SCHEMA_VERSION,
   PinConflictError,
   PinStore,
   PinStoreIntegrityError,
+  deriveScopeId,
   deriveServerId,
 } from "../../src/audit/manifest.js";
 import type { PinInput } from "../../src/audit/manifest.js";
@@ -295,7 +298,9 @@ describe("the file is security state", () => {
     await store.flush();
     const doc = JSON.parse(await readFile(pinPath(), "utf8")) as Record<string, unknown>;
     expect(doc["format"]).toBe(PIN_FILE_FORMAT);
-    expect(doc["schemaVersion"]).toBe(1);
+    // Bumped to 2 when `scope` entered the pin key; see PIN_FILE_SCHEMA_VERSION.
+    expect(doc["schemaVersion"]).toBe(PIN_FILE_SCHEMA_VERSION);
+    expect(doc["schemaVersion"]).toBe(2);
     expect(doc["canonicalizationVersion"]).toBe(1);
     expect(doc["revision"]).toBe(1);
     expect(doc["integrity"]).toMatch(/^sha256:[0-9a-f]{64}$/);
@@ -402,5 +407,160 @@ describe("the file is security state", () => {
     await store.flush();
     const { readdir } = await import("node:fs/promises");
     expect((await readdir(join(dir, ".toolwall"))).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("deriveScopeId — structure is identity, secrets are not", () => {
+  it("is stable and order-insensitive in `scopes`", () => {
+    const a = deriveScopeId({ issuer: "https://idp.example", scopes: ["repo:read", "issues:write"] });
+    const b = deriveScopeId({ issuer: "https://idp.example", scopes: ["issues:write", "repo:read"] });
+    expect(a).toBe(b);
+    expect(a).toMatch(/^scope_[0-9a-f]{16}$/);
+  });
+
+  it("distinguishes a narrowed grant from a broad one", () => {
+    const broad = deriveScopeId({ subject: "alice", scopes: ["repo:read", "repo:write"] });
+    const narrow = deriveScopeId({ subject: "alice", scopes: ["repo:read"] });
+    expect(broad).not.toBe(narrow);
+  });
+
+  it("returns the default scope for an empty descriptor, so callers need no special case", () => {
+    expect(deriveScopeId({})).toBe(DEFAULT_PIN_SCOPE);
+    expect(deriveScopeId({ label: "" })).toBe(DEFAULT_PIN_SCOPE);
+  });
+
+  it("REFUSES credential-shaped input rather than hashing a secret into long-lived state", () => {
+    const jwt =
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    expect(() => deriveScopeId({ subject: jwt })).toThrow(/looks like a credential/);
+    expect(() => deriveScopeId({ label: "ghp_" + "A".repeat(40) })).toThrow(/looks like a credential/);
+    expect(() => deriveScopeId({ scopes: ["x".repeat(64)] })).toThrow(/looks like a credential/);
+    // ...while ordinary identifiers pass.
+    expect(() => deriveScopeId({ issuer: "https://login.microsoftonline.com/common/v2.0" })).not.toThrow();
+    expect(() => deriveScopeId({ label: "ci-readonly-token" })).not.toThrow();
+  });
+});
+
+describe("scope is part of the pin key (RESEARCH-BRIEF §4.5 item 6)", () => {
+  const narrow = deriveScopeId({ subject: "alice", scopes: ["repo:read"] });
+  const broad = deriveScopeId({ subject: "alice", scopes: ["repo:read", "repo:write"] });
+
+  it("the SAME tool under two credentials is two pins, not a conflict", async () => {
+    const store = await openStore();
+    store.pin(input({ scope: broad, hash: "sha256:broad" }));
+    // Under a narrower token the server legitimately advertises a narrower schema. Without scope
+    // keying this is a PinConflictError and the operator gets a rug-pull alarm for downgrading
+    // their own token.
+    expect(() => store.pin(input({ scope: narrow, hash: "sha256:narrow" }))).not.toThrow();
+    expect(store.get("srv_test", "tool", "add", broad)?.hash).toBe("sha256:broad");
+    expect(store.get("srv_test", "tool", "add", narrow)?.hash).toBe("sha256:narrow");
+    expect(store.size).toBe(2);
+  });
+
+  it("still conflicts within one scope — the control is not weakened, only keyed correctly", async () => {
+    const store = await openStore();
+    store.pin(input({ scope: narrow, hash: "sha256:one" }));
+    expect(() => store.pin(input({ scope: narrow, hash: "sha256:two" }))).toThrow(PinConflictError);
+  });
+
+  it("an unscoped lookup does not see a scoped pin, and vice versa", async () => {
+    const store = await openStore();
+    store.pin(input({ scope: narrow }));
+    expect(store.get("srv_test", "tool", "add")).toBeUndefined();
+    expect(store.has("srv_test", "tool", "add")).toBe(false);
+    expect(store.get("srv_test", "tool", "add", narrow)).toBeDefined();
+  });
+
+  it("listForSubject surfaces every scope, which is what makes a drift alert legible", async () => {
+    const store = await openStore();
+    store.pin(input({ scope: broad, hash: "sha256:x" }));
+    store.pin(input({ scope: narrow, hash: "sha256:x" }));
+    const all = store.listForSubject("srv_test", "tool", "add");
+    expect(all).toHaveLength(2);
+    expect(new Set(all.map((r) => r.scope))).toEqual(new Set([broad, narrow]));
+  });
+
+  it("list() can filter by scope and sorts stably with it", async () => {
+    const store = await openStore();
+    store.pin(input({ scope: broad, subject: "b" }));
+    store.pin(input({ scope: narrow, subject: "a" }));
+    expect(store.list({ scope: narrow }).map((r) => r.subject)).toEqual(["a"]);
+    expect(store.list().map((r) => r.subject)).toHaveLength(2);
+  });
+
+  it("approveDrift and markVerified act on one scope only", async () => {
+    const store = await openStore();
+    store.pin(input({ scope: broad, hash: "sha256:x" }));
+    store.pin(input({ scope: narrow, hash: "sha256:x" }));
+    store.approveDrift(
+      input({
+        scope: narrow,
+        hash: "sha256:y",
+        decision: { kind: "drift-re-approval", at: "2026-08-20T00:00:00.000Z", by: "user:alice" },
+      }),
+    );
+    // Approving under one credential says nothing about the other.
+    expect(store.get("srv_test", "tool", "add", narrow)?.hash).toBe("sha256:y");
+    expect(store.get("srv_test", "tool", "add", broad)?.hash).toBe("sha256:x");
+    expect(store.markVerified("srv_test", "tool", "add", new Date(), broad)).toBe(true);
+    expect(store.markVerified("srv_test", "tool", "add", new Date(), "scope_nope")).toBe(false);
+  });
+
+  it("round-trips scope through the file", async () => {
+    const store = await openStore();
+    store.pin(input({ scope: narrow }));
+    await store.flush();
+    const reopened = await openStore();
+    expect(reopened.get("srv_test", "tool", "add", narrow)?.scope).toBe(narrow);
+  });
+});
+
+describe("v1 pin files still load", () => {
+  it("adopts every v1 record at the default scope and says so in a warning", async () => {
+    // A v1 file: schemaVersion 1, no `scope` on any record. Written by a week-1 build.
+    const store = await openStore();
+    store.pin(input());
+    await store.flush();
+    const doc = JSON.parse(await readFile(pinPath(), "utf8")) as Record<string, unknown>;
+    doc["schemaVersion"] = 1;
+    for (const p of doc["pins"] as Record<string, unknown>[]) delete p["scope"];
+    // Recompute the digest so we are testing migration, not the integrity check.
+    const { createHash } = await import("node:crypto");
+    const { canonicalize } = await import("../../src/guards/metadata/canonicalize.js");
+    const withoutIntegrity = { ...doc };
+    delete withoutIntegrity["integrity"];
+    doc["integrity"] = `sha256:${createHash("sha256").update(canonicalize(withoutIntegrity), "utf8").digest("hex")}`;
+    await writeFile(pinPath(), JSON.stringify(doc, null, 2), "utf8");
+
+    const reopened = await openStore();
+    expect(reopened.get("srv_test", "tool", "add")?.scope).toBe(DEFAULT_PIN_SCOPE);
+    expect(reopened.warnings.join(" ")).toMatch(/schemaVersion 1/);
+  });
+
+  it("still refuses a schemaVersion it cannot read", async () => {
+    const store = await openStore();
+    store.pin(input());
+    await store.flush();
+    const doc = JSON.parse(await readFile(pinPath(), "utf8")) as Record<string, unknown>;
+    doc["schemaVersion"] = 99;
+    await writeFile(pinPath(), JSON.stringify(doc, null, 2), "utf8");
+    await expect(openStore()).rejects.toThrow(PinStoreIntegrityError);
+  });
+
+  it("fails closed on a non-string scope rather than guessing", async () => {
+    const store = await openStore();
+    store.pin(input());
+    await store.flush();
+    const doc = JSON.parse(await readFile(pinPath(), "utf8")) as Record<string, unknown>;
+    (doc["pins"] as Record<string, unknown>[])[0]!["scope"] = 42;
+    const { createHash } = await import("node:crypto");
+    const { canonicalize } = await import("../../src/guards/metadata/canonicalize.js");
+    const withoutIntegrity = { ...doc };
+    delete withoutIntegrity["integrity"];
+    doc["integrity"] = `sha256:${createHash("sha256").update(canonicalize(withoutIntegrity), "utf8").digest("hex")}`;
+    await writeFile(pinPath(), JSON.stringify(doc, null, 2), "utf8");
+    await expect(openStore()).rejects.toThrow(/non-string `scope`/);
   });
 });

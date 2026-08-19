@@ -196,3 +196,23 @@ export function starterPolicyDocument(ws: Workspace): Record<string, unknown> {
     },
   };
 }
+
+/**
+ * The starter policy PLUS a global egress allowlist — the Week 2 scenario.
+ *
+ * The host list is what an operator would plausibly write after looking at their own traffic:
+ * their API, its subdomains, and localhost. It deliberately does NOT contain every host that
+ * appears anywhere in the corpus, because a real operator's allowlist never does — and the gap is
+ * exactly what `enforce: "scan"` costs. Measuring with a list tuned to score well would be
+ * measuring nothing.
+ */
+export function egressPolicyDocument(ws: Workspace, enforce: "roles" | "scan"): Record<string, unknown> {
+  return {
+    ...starterPolicyDocument(ws),
+    egress: {
+      enforce,
+      hosts: ["api.example.com", "*.example.com", "127.0.0.1"],
+      schemes: ["https", "http"],
+    },
+  };
+}

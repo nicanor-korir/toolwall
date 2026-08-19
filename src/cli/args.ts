@@ -4,6 +4,7 @@
  */
 
 import type { StrictnessTier } from '../policy/schema.js';
+import type { ReplayPolicy } from '../transport/reconnect.js';
 import { isProtocolEra, type ProtocolEra } from '../types/protocol.js';
 
 export type PinMode = 'tofu' | 'strict';
@@ -12,6 +13,7 @@ export type UnverifiableDisposition = 'block' | 'confirm' | 'allow';
 const TIERS = ['permissive', 'balanced', 'strict'] as const;
 const PIN_MODES = ['tofu', 'strict'] as const;
 const UNVERIFIABLE = ['block', 'confirm', 'allow'] as const;
+const REPLAY = ['none', 'read-only-methods', 'all'] as const;
 
 export interface ParsedArgs {
     readonly command: string;
@@ -40,6 +42,20 @@ export interface ParsedArgs {
      * suspected false positive. It turns the product off; the CLI says so on stderr.
      */
     readonly noGuards: boolean;
+    /**
+     * Buffer and retry when the upstream server blips, instead of taking the
+     * client session down with it. On by default.
+     */
+    readonly reconnect: boolean;
+    readonly reconnectAttempts: number;
+    /**
+     * What to do with a request that was already on the wire when the
+     * connection died. `read-only-methods` (default) resends only listing/read
+     * methods; a `tools/call` whose execution status is unknown gets an explicit
+     * `-32603` rather than being run a second time. See
+     * `src/transport/reconnect.ts`.
+     */
+    readonly replayInFlight: ReplayPolicy;
 }
 
 export type ParseResult =
@@ -93,6 +109,21 @@ GUARDS
                           file only; toolwall makes no network calls, ever.
   --no-guards             Bare passthrough, every guard off. This turns the
                           product off. For latency comparison and FP bisection.
+
+RESILIENCE
+  --no-reconnect          Do not buffer and retry when the upstream server
+                          blips; close the client session immediately instead.
+  --reconnect-attempts <n>  Attempts before returning -32603 to the buffered
+                          requests. Default 3, over roughly two seconds.
+  --replay-in-flight <p>  none | read-only-methods (default) | all. What to do
+                          with a request already on the wire when the
+                          connection died. Its execution status is unknown, so
+                          the default resends only listing/read methods and
+                          answers -32603 for anything that may have side
+                          effects. Setting all accepts at-least-once delivery.
+                          A reconnected server is ALWAYS re-verified against
+                          the pin store before any buffered request is
+                          released; that is not configurable.
 
 EXAMPLE
   toolwall --server "node ./path/to/server.js"
@@ -181,6 +212,9 @@ export function parseArgs(argv: readonly string[]): ParseResult {
     let pinMode: PinMode = 'tofu';
     let onUnverifiable: UnverifiableDisposition = 'confirm';
     let noGuards = false;
+    let reconnect = true;
+    let reconnectAttempts = 3;
+    let replayInFlight: ReplayPolicy = 'read-only-methods';
     const allowedCommands: string[] = [];
     const passthroughEnv: string[] = [];
     let trailing: string[] | undefined;
@@ -221,6 +255,26 @@ export function parseArgs(argv: readonly string[]): ParseResult {
             case '--no-guards':
                 noGuards = true;
                 break;
+            case '--no-reconnect':
+                reconnect = false;
+                break;
+            case '--reconnect-attempts': {
+                const value = needsValue(arg, argv[++i]);
+                const parsedValue = value === null ? Number.NaN : Number(value);
+                if (!Number.isInteger(parsedValue) || parsedValue < 0 || parsedValue > 100) {
+                    return { kind: 'error', message: '--reconnect-attempts must be an integer between 0 and 100.' };
+                }
+                reconnectAttempts = parsedValue;
+                break;
+            }
+            case '--replay-in-flight': {
+                const value = needsValue(arg, argv[++i]);
+                if (value === null || !(REPLAY as readonly string[]).includes(value)) {
+                    return { kind: 'error', message: '--replay-in-flight must be none, read-only-methods or all.' };
+                }
+                replayInFlight = value as ReplayPolicy;
+                break;
+            }
             case '--policy': {
                 const value = needsValue(arg, argv[++i]);
                 if (value === null) {
@@ -362,7 +416,10 @@ export function parseArgs(argv: readonly string[]): ParseResult {
             ...(auditFile !== undefined ? { auditFile } : {}),
             pinMode,
             onUnverifiable,
-            noGuards
+            noGuards,
+            reconnect,
+            reconnectAttempts,
+            replayInFlight
         }
     };
 }

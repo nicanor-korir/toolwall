@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { benignCorpus, corpusSummary, corpusToolSource, createWorkspace, starterPolicyDocument, type BenignCase, type Workspace } from "../fixtures/benign/index.js";
+import { benignCorpus, corpusSummary, corpusToolSource, createWorkspace, egressPolicyDocument, starterPolicyDocument, type BenignCase, type Workspace } from "../fixtures/benign/index.js";
 import { CapabilityGuard } from "../../src/guards/runtime/capability-guard.js";
 import { SchemaGuard } from "../../src/guards/runtime/schema-guard.js";
 import { defaultPolicy, parsePolicy, type ResolvedPolicy } from "../../src/policy/parse.js";
@@ -58,9 +58,11 @@ interface Outcome {
   readonly findings: readonly Finding[];
 }
 
+type Scenario = "day-zero" | "configured" | "egress-roles" | "egress-scan";
+
 interface Report {
   readonly tier: StrictnessTier;
-  readonly scenario: "day-zero" | "configured";
+  readonly scenario: Scenario;
   readonly total: number;
   readonly blocked: number;
   readonly confirmed: number;
@@ -83,7 +85,7 @@ function findingsOf(v: Verdict): readonly Finding[] {
   return "findings" in v ? v.findings : [];
 }
 
-function run(policy: ResolvedPolicy, tier: StrictnessTier, scenario: Report["scenario"]): Report {
+function run(policy: ResolvedPolicy, tier: StrictnessTier, scenario: Scenario): Report {
   const tools = corpusToolSource(corpus);
   // `allow` verdicts carry no findings under Dev 1's contract, so informational records arrive
   // through the audit sink. They are collected here so the report can show what the guards noticed
@@ -143,13 +145,27 @@ function run(policy: ResolvedPolicy, tier: StrictnessTier, scenario: Report["sce
   };
 }
 
-function reportFor(tier: StrictnessTier, scenario: Report["scenario"]): Report {
+function documentFor(scenario: Scenario, tier: StrictnessTier): Record<string, unknown> {
+  switch (scenario) {
+    case "configured":
+      return { ...starterPolicyDocument(ws), tier };
+    case "egress-roles":
+      return { ...egressPolicyDocument(ws, "roles"), tier };
+    case "egress-scan":
+      return { ...egressPolicyDocument(ws, "scan"), tier };
+    case "day-zero":
+      throw new Error("day-zero has no document");
+  }
+}
+
+function reportFor(tier: StrictnessTier, scenario: Scenario): Report {
   if (scenario === "day-zero") return run(defaultPolicy(tier), tier, scenario);
-  const doc = { ...starterPolicyDocument(ws), tier };
-  const parsed = parsePolicy(doc);
-  if (!parsed.ok) throw new Error(`starter policy failed to parse: ${JSON.stringify(parsed.errors, null, 2)}`);
+  const parsed = parsePolicy(documentFor(scenario, tier));
+  if (!parsed.ok) throw new Error(`policy failed to parse: ${JSON.stringify(parsed.errors, null, 2)}`);
   return run(parsed.policy, tier, scenario);
 }
+
+const SCENARIOS: readonly Scenario[] = ["day-zero", "configured", "egress-roles", "egress-scan"];
 
 function pct(n: number): string {
   return `${(n * 100).toFixed(1)}%`;
@@ -159,7 +175,7 @@ describe("false-positive harness (benign corpus)", () => {
   it("reports measured false-positive rates for every tier and scenario", () => {
     const summary = corpusSummary();
     const reports: Report[] = [];
-    for (const scenario of ["day-zero", "configured"] as const) {
+    for (const scenario of SCENARIOS) {
       for (const tier of TIERS) reports.push(reportFor(tier, scenario));
     }
 
@@ -170,11 +186,11 @@ describe("false-positive harness (benign corpus)", () => {
     lines.push(`servers: ${Object.entries(summary.byServer).map(([k, v]) => `${k}=${v}`).join("  ")}`);
     lines.push("=".repeat(78));
     lines.push("");
-    lines.push("scenario    tier         blocked   confirm   BLOCK RATE   FRICTION RATE");
+    lines.push("scenario     tier         blocked   confirm   BLOCK RATE   FRICTION RATE");
     lines.push("-".repeat(78));
     for (const r of reports) {
       lines.push(
-        `${r.scenario.padEnd(11)} ${r.tier.padEnd(12)} ${String(r.blocked).padStart(7)} ${String(r.confirmed).padStart(9)} ${pct(r.blockRate).padStart(12)} ${pct(r.frictionRate).padStart(15)}`,
+        `${r.scenario.padEnd(12)} ${r.tier.padEnd(12)} ${String(r.blocked).padStart(7)} ${String(r.confirmed).padStart(9)} ${pct(r.blockRate).padStart(12)} ${pct(r.frictionRate).padStart(15)}`,
       );
     }
     lines.push("-".repeat(78));
@@ -201,7 +217,7 @@ describe("false-positive harness (benign corpus)", () => {
     console.log(lines.join("\n"));
 
     // Every report must be present; the assertions live in the dedicated cases below.
-    expect(reports).toHaveLength(6);
+    expect(reports).toHaveLength(SCENARIOS.length * TIERS.length);
   });
 
   /* ---------------- the hard gates ---------------- */
@@ -224,11 +240,18 @@ describe("false-positive harness (benign corpus)", () => {
     expect(r.outcomes.filter((o) => o.action === "block").map((o) => o.caseId)).toEqual([]);
   });
 
-  it("BLOCK RATE is 0% at permissive in both scenarios", () => {
+  it("BLOCK RATE is 0% at permissive in the day-zero and configured scenarios", () => {
     for (const scenario of ["day-zero", "configured"] as const) {
-      const r = reportFor(scenario === "day-zero" ? "permissive" : "permissive", scenario);
+      const r = reportFor("permissive", scenario);
       expect({ scenario, blocked: r.outcomes.filter((o) => o.action === "block").map((o) => o.caseId) }).toEqual({ scenario, blocked: [] });
     }
+  });
+
+  it("declaring a server egress allowlist does not break role-bound URL traffic", () => {
+    // The whole point of gating deny-by-default on `declared`: an operator who writes a sane
+    // allowlist for their own hosts must not have their ordinary HTTP calls blocked.
+    const r = reportFor("balanced", "egress-roles");
+    expect(r.outcomes.filter((o) => o.action === "block").map((o) => o.caseId)).toEqual([]);
   });
 
   it("strict tier, properly configured, blocks at most one benign case and names it", () => {
@@ -248,7 +271,7 @@ describe("false-positive harness (benign corpus)", () => {
   });
 
   it("every blocking finding anywhere in the corpus carries rule, tool and remediation", () => {
-    for (const scenario of ["day-zero", "configured"] as const) {
+    for (const scenario of SCENARIOS) {
       for (const tier of TIERS) {
         for (const o of reportFor(tier, scenario).outcomes) {
           for (const f of o.findings) {
