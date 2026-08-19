@@ -45,10 +45,14 @@ toolwall --policy ./toolwall-policy.json --audit-log ./toolwall-audit.jsonl \
 
 # restrict the spawnable binary; the args after -- are the server command line
 toolwall --allow-command node -- node ./path/to/server.js
-
-# never adopt a definition without a human: an unapproved tool is refused, not pinned
-toolwall --pin-mode strict --server "node ./path/to/server.js"
 ```
+
+> **`--pin-mode strict` is not usable for a working session yet.** It refuses to adopt any
+> definition without a human decision, and the interactive approval path (`ConfirmationProvider`,
+> T-06) is Week 2. Until it lands, strict fails closed on *everything* — including `initialize` —
+> because "needs a human" with no human wired is a block, never an assumption. It is useful today
+> only to see what a server is asking you to approve. The default, `--pin-mode tofu`, adopts the
+> first definition it sees and enforces from then on.
 
 `toolwall --help` lists every flag. Diagnostics — the spawn record, guard findings, drift diffs —
 go to **stderr**; stdout is the JSON-RPC channel and carries nothing else.
