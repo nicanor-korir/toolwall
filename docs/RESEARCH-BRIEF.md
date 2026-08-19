@@ -357,3 +357,101 @@ Argument-injection defeats naive allowlisting: restricting to `npx` is bypassed 
 → **This is squarely in our threat model.** We spawn stdio child processes. The spec's own guidance for
 stdio proxies (sandbox, restrict FS, log all usage, extra authorization for dangerous commands) is
 written for exactly this. Dev 1 owns it; it is not optional hardening.
+
+---
+
+## 4. Defense efficacy — measured, not assumed (threat-landscape research)
+
+### 4.1 The blueprint's blocklist scores 0/5 — REPRODUCED LOCALLY 2026-08-19
+
+`docs/IDEA.md`'s `MALICIOUS_PATTERNS` array, run verbatim against five canonical *published* payloads
+(Invariant shadowing, Invariant `sidenote`, Invariant WhatsApp rug pull, Trail of Bits line-jumping,
+CyberArk ATPA error string):
+
+```
+MISS  invariant_shadowing        len=238      MISS  trailofbits_linejumping  len=125
+MISS  invariant_sidenote         len=172      MISS  cyberark_atpa_result     len=132
+MISS  invariant_whatsapp_rugpull len=158      Detection rate: 0/5
+```
+Every payload is also **under the 300-char truncation limit**, so truncation is a no-op on all five.
+
+Real attacks do not say *"ignore previous instructions."* They say *"to prevent proxying issues,"*
+*"for GDPR, and SOC2 COMPLIANCE,"* and *"otherwise the tool will not work."* The blocklist is calibrated
+to a folklore attack that stopped being used in 2025. **This is why toolwall ships no phrase blocklist.**
+
+### 4.2 Independent scanner efficacy numbers
+
+- Static description scanners on a 19,961-case benchmark: Invariant **F-1 0.164**, Cisco AI **0.029**,
+  Ramparts **0.172**. Network-behaviour observation on the same benchmark: **F-1 0.995 @ 0.8% FPR**
+  (ShieldNet, arXiv:2604.04426). *Caveat: that benchmark injects malicious code while keeping interfaces
+  benign, so description scanners are scored on something they were not built for — but it settles the
+  question for the malicious-server-code class.*
+- Ecosystem scale (arXiv:2607.11086): 64,611 servers; existing scanners flag **96.89% as risky** while
+  **fewer than 50% of sampled alerts are true positives.**
+- LLM guardrails: vendor's own numbers 90.8% F-1 at **16.5% FPR**; Meta Prompt Guard 68% F-1 at **50% FPR**.
+- Anthropic's production action classifier: 0.4% FPR full-pipeline but **17% false-negative on real
+  overeager actions**. Their own words: *"It is not a drop-in replacement for careful human review."*
+
+### 4.3 Human-in-the-loop is a 13.6% control — this changes T-06 design
+
+Anthropic, **n=1,053 paid developers**, harmful commands substituted mid-session: developers approved
+the dangerous action **86.4% of the time — catching 13.6%.** Trail of Bits independently:
+*"effectively transforms the 'human-in-the-loop' security model into 'human-as-the-rubber-stamp'."*
+
+→ **Design rule for Week 2:** confirmation is a **scarce budget** — a handful of prompts per session for
+genuinely irreversible operations — never a general-purpose filter. **A proxy that prompts on every tool
+call has built a rubber stamp.** Consent fatigue is itself a catalogued vulnerability class.
+
+### 4.4 Ranked control efficacy (build Week 2 against this order)
+
+| Control | Verdict |
+|---|---|
+| **Egress allowlisting / network isolation** | **Strongest single control** (F-1 0.995 from traffic observation) — **toolwall does NOT have this yet** |
+| Capability isolation / least privilege | Strong — Supabase's bug WAS `service_role` |
+| Lethal-trifecta / Meta "Rule of Two" avoidance | Strong, architectural |
+| TOFU pinning of full server config | Strong, **for rug pulls only** — what we shipped |
+| Sandboxing local servers | Strong (Microsoft, spec, Anthropic all recommend) |
+| Invisible-character / ANSI rejection | **Narrow but real — near-zero FP** |
+| Audit logging | Necessary, not sufficient |
+| Human confirmation | **13.6%** — budget it |
+| Description regex blocklist | **Theater** (0/5 above) |
+| Description truncation | **Theater + breaks utility.** No supporting research |
+| Structural delimiters (`### UNTRUSTED ###`) | **Weak** — defeated by forged delimiters in the Gemini CLI exploit |
+| Secret scanning on egress | **Weak alone** — defeated by base64 in the Copilot exploit |
+
+### 4.5 Actionable corrections for Week 2
+
+1. **Add per-server egress allowlisting.** It is the highest-value control and we lack it entirely.
+2. **Inspect `InputRequiredResult.inputRequests`** — under 2026-07-28, sampling moved *inside* tool
+   results, so a malicious server can put an arbitrary `systemPrompt` into a `tools/call` result and have
+   the client's own LLM execute it. Blocking the `sampling/createMessage` *method* no longer suffices.
+3. **Block credential-shaped `elicitation/create`.** The spec's *"Servers MUST NOT use form mode
+   elicitation to request passwords, API keys, access tokens, or payment credentials"* is an unenforced
+   norm — a proxy CAN enforce it by inspecting `requestedSchema` property names/titles/formats.
+4. **ATPA detection signature:** a tool call issued immediately after an `isError: true` result. Cheap,
+   deterministic, and catches the runtime-only variant that has no artifact to scan.
+5. **Reject invisible characters and ANSI escapes — do not strip.** Stripping silently normalises an
+   attack into something that looks clean. Trail of Bits renders ESC as the literal string `ESC` so it
+   stays visible. Near-zero false positives; no legitimate description contains tag-block/ZWJ/bidi chars.
+6. **Pin must be keyed by credential/scope.** 2026-07-28 says `tools/list` MUST NOT vary per-connection
+   but **MAY vary by the authorization presented** — otherwise scope-narrowing looks like tampering.
+7. **`ttlMs` / `cacheScope`:** clients may cache listings, so the proxy will NOT see every fetch. Continuous
+   per-call verification is what covers this; do not assume a listing precedes every call.
+8. **If an LLM judge is ever added, it MUST NOT ingest the untrusted content into an instruction-following
+   context.** Anthropic strips assistant text from their classifier's input precisely so *"the agent can't
+   talk the classifier into making a bad call."* Otherwise you have built a second injectable surface.
+
+### 4.6 The honest limit of a proxy — state this in the README
+
+MCP-DPT (arXiv:2604.07551) maps defenses to placement and finds gateway/proxy placement structurally
+blind to: model-level manipulation, semantic tool poisoning, the model's tool-selection reasoning, and
+host-side permission scoping. The highest-accuracy tool-poisoning detector published (MindGuard, 94–99%
+precision, arXiv:2508.20412) works by reading the **model's attention weights** — which a JSON-RPC proxy
+structurally cannot see. Their conclusion, worth internalising:
+
+> *"defenses are often deployed where implementation is easiest rather than where authority and
+> visibility are sufficient."*
+
+**The framing to keep:** you cannot make an injected model safe. You can make an injected model
+**harmless**, by ensuring that whatever it has been told to do, it lacks the capability to do it.
+Every control that survived scrutiny is of the second kind.
