@@ -1,7 +1,7 @@
 export { SchemaGuard, extractToolCall, checkFormat, looksCatastrophic } from "./schema-guard.js";
 export type { SchemaGuardOptions } from "./schema-guard.js";
-export { CapabilityGuard, measure } from "./capability-guard.js";
-export type { CapabilityGuardOptions, ArgumentShape } from "./capability-guard.js";
+export { CapabilityGuard, measure, measureAndScan } from "./capability-guard.js";
+export type { CapabilityGuardOptions, ArgumentShape, ScannedShape } from "./capability-guard.js";
 export { SchemaValidator } from "./json-schema.js";
 export type { ValidationTarget } from "./json-schema.js";
 export { ResultGuard, RESULT_METHODS, SERVER_REQUEST_METHODS, errorTextNames, hasProtoKey } from "./result-guard.js";

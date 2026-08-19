@@ -354,6 +354,6 @@ describe('guard pipeline', () => {
         await proxied.out.waitForId(2);
 
         expect(seen).toHaveLength(1);
-        expect((seen[0] as { tools: unknown[] }).tools).toHaveLength(7);
+        expect((seen[0] as { tools: unknown[] }).tools).toHaveLength(8);
     });
 });

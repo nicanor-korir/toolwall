@@ -63,7 +63,16 @@ server.setRequestHandler(ListToolsRequestSchema, () => ({
         { name: 'boom', description: 'Always fails.', inputSchema: { type: 'object', properties: {} } },
         { name: 'forbidden', description: 'Should never execute in the block test.', inputSchema: { type: 'object', properties: {} } },
         { name: 'calls', description: 'Returns the log of tool names invoked so far.', inputSchema: { type: 'object', properties: {} } },
-        { name: 'hang', description: 'Blocks until cancelled.', inputSchema: { type: 'object', properties: {} } }
+        { name: 'hang', description: 'Blocks until cancelled.', inputSchema: { type: 'object', properties: {} } },
+        {
+            // Exists for `bench/latency.ts`. The `large` workload echoes 64 KiB back as ONE string,
+            // which is ~6 nodes: it sizes the transport but barely exercises the response-leg walk
+            // at all. A row set is the shape a SQL, search or listing tool actually returns, and it
+            // is the shape where `measure()`/`hasProtoKey()` node cost is real.
+            name: 'rows',
+            description: 'Returns n structured rows. Sizes the response-leg walk in NODES, not bytes.',
+            inputSchema: { type: 'object', properties: { n: { type: 'number' } }, required: ['n'] }
+        }
     ],
     // An unknown key at result top level. `ResultSchema` is a loose object, so
     // this must survive both the direct and the proxied path untouched.
@@ -82,6 +91,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
 
         case 'calls':
             return { content: [{ type: 'text', text: JSON.stringify(callLog) }] };
+
+        case 'rows': {
+            const n = Math.max(0, Math.min(20000, Number(request.params.arguments?.n ?? 0)));
+            const rows = [];
+            for (let i = 0; i < n; i++) {
+                rows.push({ id: i, name: `row-${i}`, path: `/tmp/a/b/c/file-${i}.txt`, ok: i % 2 === 0, note: 'lorem ipsum dolor sit amet' });
+            }
+            return { content: [{ type: 'text', text: `${n} rows` }], structuredContent: { rows } };
+        }
 
         case 'boom':
             throw new McpError(ErrorCode.InvalidParams, 'boom happened', { detail: 'structured error data', n: 42 });

@@ -24,6 +24,12 @@ import { AtrScanner } from '../guards/metadata/rules.js';
 import { ttyChannel } from '../guards/runtime/confirm.js';
 import { AuditLog } from '../audit/log.js';
 import { PinStore, PinStoreIntegrityError } from '../audit/manifest.js';
+import {
+    NETWORK_ENABLED,
+    describeProvenance,
+    parseProvenanceArgs,
+    type ProvenanceOptions
+} from '../audit/provenance.js';
 import { defaultPolicy, parsePolicy, type ResolvedPolicy } from '../policy/parse.js';
 import { SpawnPolicyError, describeInheritedEnvironment, type SpawnSpec } from '../transport/spawn.js';
 import { totalBackoffMs } from '../transport/reconnect.js';
@@ -138,6 +144,43 @@ export async function main(argv: readonly string[]): Promise<number> {
         }
     }
 
+    /*
+     * T-09 provenance.
+     *
+     * `parseProvenanceArgs` owns the whole opt-in: it sets `network: NETWORK_ENABLED` if and only
+     * if `--verify-provenance` was typed, and `checkProvenance` makes no request in any other
+     * configuration. It is called on the argv slice BEFORE `--`, so a `--verify-provenance` that
+     * belongs to the upstream server's own command line can never switch ours on.
+     *
+     * When the operator named no provenance flag at all, `assembleToolwall` is not given a
+     * `provenance` option and the feature — including its offline half — is never constructed.
+     * That is what keeps the default path byte-identical to what it was, and network-free.
+     */
+    const optionArgv = argv.indexOf('--') === -1 ? argv : argv.slice(0, argv.indexOf('--'));
+    let provenance: ProvenanceOptions | undefined;
+    if (opts.provenance) {
+        const parsedProvenance = parseProvenanceArgs(optionArgv);
+        let serverJson: unknown;
+        if (opts.serverJsonFile !== undefined) {
+            try {
+                serverJson = JSON.parse(await readFile(opts.serverJsonFile, 'utf8'));
+            } catch (error) {
+                err(`toolwall: could not read ${opts.serverJsonFile}: ${error instanceof Error ? error.message : String(error)}`);
+                return 2;
+            }
+        }
+        provenance = { ...parsedProvenance, ...(serverJson === undefined ? {} : { serverJson }) };
+        err(
+            provenance.network === NETWORK_ENABLED
+                ? `toolwall: provenance ON with registry lookups to ${provenance.registryUrl ?? 'https://registry.npmjs.org'}. ` +
+                      'This is the ONE thing in toolwall that makes a network request, it runs once at pin time, and it ' +
+                      'reports who published a package — never that its tools are honest.'
+                : 'toolwall: provenance ON, offline. The package is resolved and any server.json fileSha256 is hashed ' +
+                      'locally; the registry half reports "not checked", which is not the same as "clean". ' +
+                      'Add --verify-provenance to look it up.'
+        );
+    }
+
     // C-14: one confirmation channel, opened once, for the life of the session. Opened here rather
     // than inside `assembleToolwall` so the CLI can say on stderr whether a human can actually be
     // reached — an operator who thinks confirmation is available when it is not will misread every
@@ -182,9 +225,12 @@ export async function main(argv: readonly string[]): Promise<number> {
             },
             ...(opts.serverId !== undefined ? { serverId: opts.serverId } : {}),
             ...(opts.noGuards
-                ? { enable: { pinning: false, schema: false, capability: false, result: false, unicode: false } }
-                : {}),
+                ? { enable: { pinning: false, schema: false, capability: false, result: false, unicode: false, inference: false } }
+                : opts.inference
+                  ? {}
+                  : { enable: { inference: false } }),
             ...(atr !== undefined ? { atr } : {}),
+            ...(provenance !== undefined ? { provenance, onProvenanceReport: report => err(`toolwall: ${describeProvenance(report)}`) } : {}),
             confirmationChannel: channel ?? null,
             onConfirmation: record =>
                 err(
@@ -216,6 +262,16 @@ export async function main(argv: readonly string[]): Promise<number> {
     } else {
         err(
             `toolwall: guards=[${toolwall.registeredGuards.join(',')}] tier=${loaded.policy.tier} pin-mode=${opts.pinMode} on-unverifiable=${opts.onUnverifiable} pins=${pins.path} (${pins.size} pinned) confirm-budget=${loaded.policy.confirmation.maxPrompts}${channel === undefined ? ' (no tty: confirm fails closed)' : ''}`
+        );
+        // Separate from the guards line on purpose: inference is not a guard, it is the policy the
+        // capability and schema guards enforce. A banner that lied about which of the two was on
+        // would be worse than no banner, so it names the one thing that decides day-zero coverage.
+        err(
+            opts.inference
+                ? `toolwall: inference=on roots=[${storeCwd}] observation=off — each tool's capability is derived from its ` +
+                      'PINNED inputSchema, and an explicit declaration in --policy always wins. --no-inference turns this off.'
+                : 'toolwall: inference=off. The capability layer now enforces only what your policy file declares; ' +
+                      `with no policy file that is nothing.${opts.policyFile === undefined ? ' You have no policy file.' : ''}`
         );
     }
     const reconnect = toolwall.proxy.reconnectPolicy;
@@ -297,6 +353,9 @@ export async function main(argv: readonly string[]): Promise<number> {
  * window Deadbugz walks through. A flush failure is reported, never swallowed.
  */
 async function persist(toolwall: Toolwall): Promise<void> {
+    // An in-flight provenance check writes findings into the audit log. Let it land before the log
+    // is flushed, or the one record the operator asked for is the one that goes missing.
+    await toolwall.provenance?.settled().catch(() => undefined);
     try {
         if (toolwall.pins.dirty) {
             await toolwall.pins.flush();

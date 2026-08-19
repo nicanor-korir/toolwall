@@ -54,7 +54,7 @@ describe('a benign server still works, with the full guard stack in the path', (
             const list = await peer.call('tools/list');
             expect(errorOf(list)).toBeUndefined();
             const tools = (list.value['result'] as { tools: Array<{ name: string }> }).tools;
-            expect(tools.map(t => t.name)).toStrictEqual(['echo', 'ask', 'slow', 'boom', 'forbidden', 'calls', 'hang']);
+            expect(tools.map(t => t.name)).toStrictEqual(['echo', 'ask', 'slow', 'boom', 'forbidden', 'calls', 'hang', 'rows']);
             // The unknown top-level key inside the result survives the guard stack untouched.
             expect((list.value['result'] as Record<string, unknown>)['x-fixture-marker']).toStrictEqual({
                 nested: [1, 2, { deep: true }]

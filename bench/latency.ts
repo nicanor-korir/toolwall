@@ -27,16 +27,21 @@
  * ## Two payload sizes, because Week 2 put work on the RESULT
  *
  * Week 1 measured request-leg guards only, so a tiny echo was a fair probe. `ResultGuard` (C-12)
- * now runs on every `tools/call`, `resources/read` and `prompts/get` RESULT: `measure()` walks the
- * payload (bounded at 200k nodes) and `hasProtoKey()` walks it again. That cost scales with the
- * result, and a 9-byte echo would hide it entirely.
+ * now runs on every `tools/call`, `resources/read` and `prompts/get` RESULT: `measureAndScan()`
+ * walks the payload once (bounded at 200k nodes), doing the size measurement and the `__proto__`
+ * scan in one pass. That cost scales with the NODE COUNT of the result, and a 9-byte echo would
+ * hide it entirely.
  *
  * So both sizes are measured:
- *   small   a 9-byte echo   — the Week-1 probe, kept for comparability with the C-11 table.
- *   large   a 64 KiB echo   — a realistic `read_file` / query result, where the response-leg walk
- *                             is actually doing work.
- * A guard cost that only appears in the `large` row is still a real cost; reporting only `small`
- * would be choosing the flattering number.
+ *   small   a 9-byte echo    — the Week-1 probe, kept for comparability with the C-11 table.
+ *   large   a 64 KiB echo    — byte-heavy: a realistic `read_file` result.
+ *   wide    2000 struct rows — NODE-heavy: what a SQL, search or listing tool returns.
+ *
+ * `large` and `wide` are both needed, because they cost different things. 64 KiB arriving as ONE
+ * string is about six nodes: the walk finishes in microseconds and the added latency there is
+ * transport and serialization. `wide` is ~12k nodes at a comparable byte size, and that is where
+ * the response-leg traversal is actually the work. A guard cost that only appears in one row is
+ * still a real cost; reporting only the flattering row would be choosing the answer.
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -206,10 +211,23 @@ const INIT_PARAMS = {
     clientInfo: { name: 'toolwall-bench', version: '0.0.0' }
 };
 
-/** The two payload sizes. `text` comes back verbatim in the result, so it sizes both legs. */
+/**
+ * The three workloads.
+ *
+ * `small` and `large` call `echo`, whose `text` comes back verbatim, so they size both legs in
+ * BYTES. `wide` calls `rows`, which returns a structured row set, and sizes the response leg in
+ * NODES.
+ *
+ * The distinction is not cosmetic and it corrects an error in the C-11 follow-up. A 64 KiB echo is
+ * one string inside two objects — about six nodes — so `measure()` and `hasProtoKey()` finish it in
+ * microseconds however many times they walk it, and its added p99 is transport and serialization
+ * cost, not guard cost. The response-leg walk only costs anything when a result has many nodes,
+ * which is what a SQL, search or directory-listing tool actually returns.
+ */
 const WORKLOADS = [
-    { name: 'small', text: 'benchmark' },
-    { name: 'large', text: 'x'.repeat(64 * 1024) }
+    { name: 'small', tool: 'echo', args: { text: 'benchmark' }, describe: '9 B echoed' },
+    { name: 'large', tool: 'echo', args: { text: 'x'.repeat(64 * 1024) }, describe: '64 KiB echoed in ONE string, ~6 nodes' },
+    { name: 'wide', tool: 'rows', args: { n: 2000 }, describe: '2000 structured rows, ~12k nodes' }
 ] as const;
 
 type WorkloadName = (typeof WORKLOADS)[number]['name'];
@@ -224,7 +242,7 @@ async function measure(label: string, makeWire: () => Wire | Promise<Wire>): Pro
 
         const out = {} as Record<WorkloadName, number[]>;
         for (const workload of WORKLOADS) {
-            const params = { name: 'echo', arguments: { text: workload.text } };
+            const params = { name: workload.tool, arguments: workload.args };
             for (let i = 0; i < WARMUP; i++) await rpc.request('tools/call', params);
 
             const samples: number[] = new Array<number>(ITERATIONS);
@@ -291,7 +309,7 @@ async function main(): Promise<void> {
             `  node        ${process.version} on ${process.platform}/${process.arch}\n` +
             `  iterations  ${ITERATIONS} per workload (after ${WARMUP} warmup)\n` +
             `  method      sequential tools/call, one in flight, same fixture server per config\n` +
-            `  workloads   ${WORKLOADS.map(w => `${w.name} (${w.text.length}B echoed)`).join(', ')}\n\n`
+            `  workloads   ${WORKLOADS.map(w => `${w.name} (${w.describe})`).join(', ')}\n\n`
     );
 
     const raw = {
@@ -307,7 +325,7 @@ async function main(): Promise<void> {
         const bare = summarize('proxy (0 guards)', raw.bare[workload.name]);
         const guarded = summarize('guarded (full stack)', raw.guarded[workload.name]);
 
-        process.stdout.write(`\n== workload: ${workload.name} (${workload.text.length} B echoed) ==\n`);
+        process.stdout.write(`\n== workload: ${workload.name} (${workload.describe}) ==\n`);
         process.stdout.write(`config                      p50       p95       p99      mean       max\n`);
         for (const s of [direct, bare, guarded]) {
             process.stdout.write(`${s.label.padEnd(20)}${ms(s.p50)}  ${ms(s.p95)}  ${ms(s.p99)}  ${ms(s.mean)}  ${ms(s.max)}\n`);

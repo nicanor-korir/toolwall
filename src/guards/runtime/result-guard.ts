@@ -12,7 +12,7 @@ import {
 import { scanRequestedSchema } from "../../policy/credentials.js";
 import type { ResolvedPolicy } from "../../policy/parse.js";
 import type { ArgumentBounds, ResponsePolicy } from "../../policy/schema.js";
-import { measure } from "./capability-guard.js";
+import { measureAndScan } from "./capability-guard.js";
 import { SchemaValidator } from "./json-schema.js";
 import { extractToolCall } from "./schema-guard.js";
 
@@ -201,11 +201,30 @@ export class ResultGuard implements Guard {
     const findings: Finding[] = [];
     let blocking = false;
 
-    // Correlate before anything else: a result pops the call it answers.
-    const correlated = this.#correlate(ctx);
+    /*
+     * Correlate before anything else: a result pops the call it answers — **contract C-19**.
+     *
+     * Only a `tools/call` result may pop the queue. `#onResult` handles all three of
+     * `RESULT_METHODS`, and the queue holds outbound `tools/call`s only, so popping it from a
+     * `resources/read` or `prompts/get` result would consume the entry belonging to a `tools/call`
+     * still in flight. That call's own result then arrives uncorrelated and its `outputSchema` is
+     * silently not enforced — a guard that still runs, still reports, and enforces nothing.
+     *
+     * Unreachable with sequential traffic and fail-safe under concurrency (the outcome is the
+     * `toolwall/result.uncorrelated` gap C-13 already documents), which is why it was bounded
+     * rather than urgent — but "bounded" is not "closed", and the fix is one comparison.
+     */
+    const correlated = ctx.method === "tools/call" ? this.#correlate(ctx) : undefined;
 
-    // 1. Size caps ---------------------------------------------------
-    const shape = measure(payload);
+    /*
+     * 1. Size caps, and the `__proto__` scan, in ONE walk -------------
+     *
+     * `measure()` and `hasProtoKey()` used to traverse the same payload back to back. On a 64 KiB
+     * result that second full walk is where the added-p99 headroom went (`docs/ARCHITECTURE.md`
+     * C-11: 4.348 ms observed against a 5 ms budget). `measureAndScan` does both in one pass; the
+     * proto check is an O(1) own-property test per object rather than a second traversal.
+     */
+    const shape = measureAndScan(payload);
     for (const f of resultBoundsFindings(shape, cfg.bounds, ctx.method, correlated?.name)) {
       findings.push(f);
       blocking = true;
@@ -220,7 +239,7 @@ export class ResultGuard implements Guard {
     // about to be parsed and walked by the client. `constructor`/`prototype` are deliberately NOT
     // included — they are ordinary words that appear as keys in real API-schema documents, and a
     // rule that blocks reading such a document is a false positive we would deserve.
-    if (hasProtoKey(payload)) {
+    if (shape.protoKey) {
       findings.push({
         ruleId: "toolwall/result.prototype-key",
         severity: "high",

@@ -25,6 +25,8 @@ import { AuditLog } from '../../src/audit/log.js';
 import { PinStore } from '../../src/audit/manifest.js';
 import type { PinEvent } from '../../src/guards/metadata/drift.js';
 import type { ConfirmationChannel, ConfirmationRecord } from '../../src/guards/runtime/confirm.js';
+import type { ProvenanceOptions, ProvenanceReport } from '../../src/audit/provenance.js';
+import type { InferenceOptions } from '../../src/policy/infer.js';
 import type { ResolvedPolicy } from '../../src/policy/parse.js';
 import { assembleToolwall, type AtrOptions, type GuardToggles, type Toolwall } from '../../src/index.js';
 import type { ReconnectPolicy } from '../../src/transport/reconnect.js';
@@ -41,6 +43,12 @@ export const RESTARTING_SERVER = path.resolve(here, '../fixtures/restarting-serv
 export const MRTR_SERVER = path.resolve(here, '../fixtures/mrtr-server.mjs');
 /** The Week-2 response-leg fixture: egress, outputSchema, ATPA, credential elicitation, unicode. */
 export const RESPONSE_SERVER = path.resolve(here, '../fixtures/response-attacks-server.mjs');
+/**
+ * The Week-3 inference fixture: an entirely legitimate server whose schemas declare exactly the
+ * capability shapes `src/policy/infer.ts` reads. The attack is the model pointing an honest tool
+ * somewhere it should not reach, which is the shape every real 2025-26 incident took.
+ */
+export const CAPABILITY_SERVER = path.resolve(here, '../fixtures/capability-server.mjs');
 
 export interface JsonRpcLine {
     readonly raw: string;
@@ -256,6 +264,15 @@ export interface AssembledOptions {
     /** The advisory ATR detector. Off unless a test hands in a scanner, exactly as in production. */
     readonly atr?: AtrOptions;
     readonly baseDir?: string;
+    /**
+     * Tuning for the inferred capability policy, which `assembleToolwall` turns ON by default.
+     * Pass `enable: { inference: false }` for the week-2 behaviour — enforce the policy file and
+     * nothing else, which at day zero is nothing.
+     */
+    readonly inference?: InferenceOptions;
+    /** T-09 provenance. Absent means the whole feature is never constructed, as in production. */
+    readonly provenance?: ProvenanceOptions;
+    readonly onProvenanceReport?: (report: ProvenanceReport) => void;
 }
 
 export async function connectAssembled(options: AssembledOptions = {}): Promise<AssembledPeer> {
@@ -288,6 +305,9 @@ export async function connectAssembled(options: AssembledOptions = {}): Promise<
         ...(options.enable !== undefined ? { enable: options.enable } : {}),
         ...(options.era !== undefined ? { era: options.era } : {}),
         ...(options.atr !== undefined ? { atr: options.atr } : {}),
+        ...(options.inference !== undefined ? { inference: options.inference } : {}),
+        ...(options.provenance !== undefined ? { provenance: options.provenance } : {}),
+        ...(options.onProvenanceReport !== undefined ? { onProvenanceReport: options.onProvenanceReport } : {}),
         confirmationChannel: options.confirmationChannel === undefined ? null : options.confirmationChannel,
         onConfirmation: record => confirmations.push(record),
         baseDir: options.baseDir ?? dir,

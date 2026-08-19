@@ -200,6 +200,38 @@ describe('the documented invocation, run verbatim', () => {
             'toolwall: guards=[metadata.pin,metadata.unicode,schema-guard,capability-guard,result-guard]'
         );
         expect(session.stderr()).not.toContain('metadata.atr');
+
+        // Inference is deliberately NOT in the guards list — it is not a guard, it is the policy
+        // the capability and schema guards enforce — but the operator still has to be told which
+        // of the two postures they are in, because it is what decides day-zero coverage.
+        expect(session.stderr()).toContain('toolwall: inference=on');
+        expect(session.stderr()).toContain('observation=off');
+        // T-09 is off and unmentioned: nothing was asked for, so nothing was constructed.
+        expect(session.stderr()).not.toContain('provenance');
+    });
+
+    it('accepts the Week-3 flags verbatim, and provenance stays offline without --verify-provenance', async () => {
+        dir = await mkdtemp(path.join(tmpdir(), 'toolwall-cli-wk3-'));
+        const session = startCli(
+            ['--no-inference', '--provenance-bundle', '--server', `node ${BENIGN}`],
+            dir
+        );
+        sessions.push(session);
+
+        const init = await session.request('initialize', INIT);
+        expect(init['result']).toBeDefined();
+        session.notify('notifications/initialized');
+        // List first: without a pin, `--on-unverifiable confirm` fails closed with no controlling
+        // terminal, which would be a real block for a reason that has nothing to do with Week 3.
+        await session.request('tools/list');
+        const call = await session.request('tools/call', { name: 'echo', arguments: { text: 'ok' } });
+        expect(call['result']).toStrictEqual({ content: [{ type: 'text', text: 'ok' }] });
+
+        expect(session.stderr()).toContain('toolwall: inference=off');
+        // `--provenance-bundle` alone turns the FEATURE on and the NETWORK stays off. The gate is
+        // `--verify-provenance` and nothing else, and the banner has to say which one you got.
+        expect(session.stderr()).toContain('provenance ON, offline');
+        expect(session.stderr()).not.toContain('registry lookups to');
     });
 
     it('toolwall --allow-command node -- <cmd> is accepted, and a non-allowlisted binary is refused', async () => {

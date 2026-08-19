@@ -55,6 +55,25 @@ export interface ParsedArgs {
      */
     readonly advisoryRules?: AtrLane;
     /**
+     * Inferred capability policy. **On by default**; `--no-inference` turns it off.
+     *
+     * Measured (`test/unit/infer.test.ts`, `test/unit/fp-harness.test.ts`): at zero configuration
+     * it catches 15/17 capability-abuse calls against 0/17 without it, for 0.0% false positives on
+     * the 59-case benign corpus — the same 0.0% the no-inference baseline scores. Off, the
+     * capability layer enforces exactly what a policy file declares, which at day zero is nothing.
+     */
+    readonly inference: boolean;
+    /**
+     * True when the operator named at least one `--provenance*` / `--verify-provenance` flag.
+     *
+     * Absent, `assembleToolwall` is not given a `provenance` option at all and the entire T-09 path
+     * — including the offline half — never runs. The *network* half additionally requires
+     * `--verify-provenance`; that gate lives in `parseProvenanceArgs`, not here.
+     */
+    readonly provenance: boolean;
+    /** `--server-json <path>`: a `server.json` whose `fileSha256` the artifact is checked against. */
+    readonly serverJsonFile?: string;
+    /**
      * Buffer and retry when the upstream server blips, instead of taking the
      * client session down with it. On by default.
      */
@@ -121,6 +140,18 @@ GUARDS
                           file only; toolwall makes no network calls, ever.
   --no-guards             Bare passthrough, every guard off. This turns the
                           product off. For latency comparison and FP bisection.
+  --no-inference          Turn OFF the inferred capability policy, which is ON
+                          by default. Inference derives each tool's filesystem
+                          and network capability from its own PINNED inputSchema,
+                          so a calculator needs no hand-written rule saying it
+                          may not read ~/.ssh/id_rsa. Measured on this repo's
+                          corpora: 15/17 capability-abuse calls caught with no
+                          policy file, against 0/17 without it, at 0.0% false
+                          positives on the 59-case benign corpus — the same
+                          0.0% the no-inference baseline scores. An explicit
+                          declaration in --policy always wins per capability.
+                          Turning this off means the capability layer enforces
+                          only what a policy file declares.
   --advisory-rules <lane> enforce | alert | hunt. Turn ON the advisory
                           agent-threat-rules detector, which is OFF by default.
                           It never blocks: matches go to stderr and the audit
@@ -130,8 +161,26 @@ GUARDS
                           Needs the optional agent-threat-rules package
                           (9.3 MB); startup gets ~1s slower while it loads.
 
+PROVENANCE (T-09) — OFF unless you name one of these
+  --verify-provenance     Look up the package's npm build attestation. THIS IS
+                          THE ONE FLAG THAT MAKES A NETWORK REQUEST. Without it
+                          toolwall makes none, ever. It reports whether an
+                          attestation exists and who published it; it does NOT
+                          cryptographically verify the Sigstore bundle, and
+                          provenance says who published a package, never that
+                          its tools are honest.
+  --provenance-registry <url>  Registry origin to query. https only. Default
+                          https://registry.npmjs.org
+  --provenance-bundle     Also fetch the attestation bundle to read the source
+                          repo, commit and builder out of the SLSA predicate.
+  --server-json <path>    A server.json describing this server. Its fileSha256
+                          is the one check here that is fully offline and
+                          deterministic.
+  --provenance-artifact <path>  Local artifact (.mcpb / tarball) to hash against
+                          that fileSha256. Offline; no network involved.
+
 RESILIENCE
-  --no-reconnect          Do not buffer and retry when the upstream server
+  --no-reconnect        Do not buffer and retry when the upstream server
                           blips; close the client session immediately instead.
   --reconnect-attempts <n>  Attempts before returning -32603 to the buffered
                           requests. Default 3, over roughly two seconds.
@@ -238,6 +287,9 @@ export function parseArgs(argv: readonly string[]): ParseResult {
     let onUnverifiable: UnverifiableDisposition = 'confirm';
     let noGuards = false;
     let advisoryRules: AtrLane | undefined;
+    let inference = true;
+    let provenance = false;
+    let serverJsonFile: string | undefined;
     let reconnect = true;
     let reconnectAttempts = 3;
     let replayInFlight: ReplayPolicy = 'read-only-methods';
@@ -289,6 +341,39 @@ export function parseArgs(argv: readonly string[]): ParseResult {
             case '--no-guards':
                 noGuards = true;
                 break;
+            case '--no-inference':
+                inference = false;
+                break;
+            /*
+             * The provenance flags are *consumed* here but *interpreted* by
+             * `parseProvenanceArgs` in `src/audit/provenance.ts`, which the CLI calls on the same
+             * argv. Deliberately not re-implemented: the opt-in, the default and the network gate
+             * live in one file so "can this thing phone home without me asking" has one answer to
+             * read. All this switch does is accept them as known options and record that at least
+             * one was named, so an unnamed run never constructs the feature at all.
+             */
+            case '--verify-provenance':
+            case '--provenance-bundle':
+                provenance = true;
+                break;
+            case '--provenance-registry':
+            case '--provenance-artifact': {
+                const value = needsValue(arg, argv[++i]);
+                if (value === null) {
+                    return { kind: 'error', message: `${arg} requires a value.` };
+                }
+                provenance = true;
+                break;
+            }
+            case '--server-json': {
+                const value = needsValue(arg, argv[++i]);
+                if (value === null) {
+                    return { kind: 'error', message: '--server-json requires a path.' };
+                }
+                serverJsonFile = value;
+                provenance = true;
+                break;
+            }
             case '--no-reconnect':
                 reconnect = false;
                 break;
@@ -452,6 +537,9 @@ export function parseArgs(argv: readonly string[]): ParseResult {
             onUnverifiable,
             noGuards,
             ...(advisoryRules !== undefined ? { advisoryRules } : {}),
+            inference,
+            provenance,
+            ...(serverJsonFile !== undefined ? { serverJsonFile } : {}),
             reconnect,
             reconnectAttempts,
             replayInFlight

@@ -32,6 +32,31 @@
  * `uni` = `UnicodeHygieneGuard`, `atr` = `AtrAdvisoryGuard` (opt-in; never constructed unless the
  * operator hands in a scanner).
  *
+ * ## The policy those guards enforce — inferred by default (Week 3)
+ *
+ * `SchemaGuard`, `CapabilityGuard` and `ResultGuard` all take a `ResolvedPolicy`. The one they get
+ * is `inferredPolicy(base, tools)`, not `base`, and that wrapper is the Week-3 deliverable. It
+ * derives each tool's filesystem and network capability from the tool's own **pinned**
+ * `inputSchema` (C-1 again: from the live listing a server could widen its schema and mint itself
+ * a capability), so a calculator whose schema is two numbers needs no hand-written rule saying it
+ * may not read `~/.ssh/id_rsa`.
+ *
+ * It is ON by default because the alternative measured 0/17. The bare tier preset declares no
+ * roots and no hosts for any tool, so before this the capability layer enforced nothing until
+ * somebody wrote a policy file, and `docs/POSITIONING.md` is blunt that nobody writes policy files.
+ * Measured: **0.0% false positives against the 0.0% day-zero baseline, 15/17 (88.2%) capability
+ * abuse caught against 0/17 (0.0%)**, and an explicit operator declaration still wins per
+ * capability. `observation` stays off — its cost has not been measured, so it is not a default.
+ *
+ * ## Provenance — off unless asked for
+ *
+ * `provenanceObserver` is wired into `MetadataPinGuard.onEvent`, so the T-09 check runs once, at
+ * the moment an operator grants trust under TOFU, off the guard's synchronous path. It is
+ * constructed only when `ToolwallOptions.provenance` is supplied, and it makes a network request
+ * only when that option carries `network: "allow-registry-lookups"` — which `parseProvenanceArgs`
+ * sets if and only if `--verify-provenance` was typed. **The default path makes zero requests**,
+ * asserted against the real global `fetch` in `test/integration/inference-provenance-e2e.test.ts`.
+ *
  * ## Why that order on `tools/call`, specifically
  *
  * 1. **`MetadataPinGuard` first.** If the tool definition no longer matches the one that was
@@ -80,10 +105,12 @@
  * the transparency guarantee.
  *
  * Note honestly what the Week-2 registrations cost on the hot path: every `tools/call`,
- * `resources/read` and `prompts/get` RESULT now walks `measure()` (bounded at 200k nodes) and
- * `hasProtoKey()` instead of being forwarded by reference, and every listing walks `scanSurface()`.
- * That is new per-result work Week 1 never benchmarked. `bench/latency.ts` measures it and
- * `docs/ARCHITECTURE.md` C-11 records the numbers.
+ * `resources/read` and `prompts/get` RESULT is walked by `measureAndScan()` (bounded at 200k
+ * nodes) instead of being forwarded by reference, and every listing walks `scanSurface()`. That
+ * walk used to be two — `measure()` then `hasProtoKey()` — and Week 3 fused them into one pass.
+ * `bench/latency.ts` measures the whole thing at three payload shapes and `docs/ARCHITECTURE.md`
+ * C-11 records the numbers, including the correction that the cost scales with a result's NODE
+ * COUNT and not with its byte size.
  */
 
 import type { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -91,6 +118,12 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 
 import { AuditLog } from './audit/log.js';
 import { DEFAULT_PIN_SCOPE, PinStore, type PinScope } from './audit/manifest.js';
+import {
+    provenanceObserver,
+    type ProvenanceObserver,
+    type ProvenanceOptions,
+    type ProvenanceReport
+} from './audit/provenance.js';
 import { MetadataPinGuard, type PinEvent } from './guards/metadata/drift.js';
 import { AtrAdvisoryGuard, ATR_GUARD_RESPONSE_METHODS, type AtrMode, type AtrScanner } from './guards/metadata/rules.js';
 import { UnicodeHygieneGuard, UNICODE_GUARD_RESPONSE_METHODS } from './guards/metadata/unicode.js';
@@ -104,12 +137,14 @@ import {
 import { ResultGuard, RESULT_METHODS, SERVER_REQUEST_METHODS } from './guards/runtime/result-guard.js';
 import { SchemaGuard } from './guards/runtime/schema-guard.js';
 import type { Finding, GuardContext, ToolDefinition, ToolDefinitionSource } from './policy/contract.js';
+import { inferredPolicy, type InferenceOptions } from './policy/infer.js';
 import { defaultPolicy, type ResolvedPolicy } from './policy/parse.js';
 import { DefaultGuardPipeline } from './transport/pipeline.js';
 import { ToolwallProxy, type ProxyEvent } from './transport/proxy.js';
 import type { ReconnectPolicy } from './transport/reconnect.js';
 import {
     createUpstreamStdioTransport,
+    serverIdentityForSpawn,
     type SpawnAudit,
     type SpawnPolicy,
     type SpawnSpec
@@ -204,6 +239,14 @@ export interface GuardToggles {
     readonly result?: boolean;
     /** `UnicodeHygieneGuard` — invisible-character and ANSI rejection on server metadata. */
     readonly unicode?: boolean;
+    /**
+     * Inferred capability policy (`src/policy/infer.ts`). **Default ON** — see
+     * {@link ToolwallOptions.inference}. This is not a guard; it is the policy the capability and
+     * schema guards enforce, so turning it off does not remove a guard, it removes what that guard
+     * has to say at zero configuration. Set `false` to enforce exactly the policy file (or the bare
+     * tier preset, which declares nothing).
+     */
+    readonly inference?: boolean;
 }
 
 /** How the advisory `agent-threat-rules` detector is turned on. See {@link ToolwallOptions.atr}. */
@@ -228,6 +271,42 @@ export interface ToolwallOptions {
     readonly pins: PinStore;
     /** Capability policy. Defaults to the `balanced` tier preset with no policy file. */
     readonly policy?: ResolvedPolicy;
+    /**
+     * Tuning for the **inferred capability policy**, which is ON by default (`enable.inference`).
+     *
+     * `assembleToolwall` wraps whatever {@link policy} resolves to in `inferredPolicy(base, tools)`
+     * — `tools` being the PIN-backed source, per C-1, so a server cannot mint itself a capability by
+     * widening its own live schema. Without this, `defaultPolicy()` declares no filesystem roots and
+     * no hosts for any tool, and the capability layer therefore constrains nothing until somebody
+     * writes a policy file. Measured (`test/unit/infer.test.ts`, `test/unit/fp-harness.test.ts`):
+     * **0.0% false positives against a 0.0% baseline, 15/17 (88.2%) capability-abuse calls caught
+     * against 0/17 (0.0%)** at zero configuration.
+     *
+     * `roots` defaults to `[baseDir]` when {@link baseDir} is given, otherwise to `process.cwd()`.
+     * `observation` stays `"off"` unless it is set here: its false-positive cost is a function of
+     * session shape and has not been measured, and we do not default on a control whose cost we
+     * have not counted.
+     *
+     * An explicit operator declaration always wins, per capability — see `src/policy/infer.ts`.
+     */
+    readonly inference?: InferenceOptions;
+    /**
+     * T-09 package provenance. **Absent means the whole feature is off**, which is the default and
+     * the only configuration that exists unless a caller passes this.
+     *
+     * Supplying it builds a `provenanceObserver` and wires it into `MetadataPinGuard.onEvent`, so
+     * the check runs once, at the moment an operator grants trust under TOFU, off the guard's
+     * synchronous hot path. It can neither block a call nor add latency to one.
+     *
+     * **Zero network unless `network: "allow-registry-lookups"`.** `parseProvenanceArgs()` is the
+     * only thing the CLI uses to build this, and it sets that field if and only if
+     * `--verify-provenance` was typed. Offline it still resolves the package, still hashes a local
+     * artifact against a `server.json` `fileSha256`, and reports `not-checked` for the registry
+     * half — which is deliberately not the same thing as "clean".
+     */
+    readonly provenance?: ProvenanceOptions;
+    /** The finished provenance report, e.g. so the CLI can print it on stderr. */
+    readonly onProvenanceReport?: (report: ProvenanceReport) => void;
     /** Destination for C-2 records and for blocked/annotated events. Defaults to memory only. */
     readonly audit?: AuditLog;
     readonly pinMode?: 'tofu' | 'strict';
@@ -313,6 +392,14 @@ export interface Toolwall {
     readonly audit: AuditLog;
     /** `undefined` when pinning is disabled. */
     readonly pinGuard: MetadataPinGuard | undefined;
+    /**
+     * The policy the guards actually enforce — the inferred wrapper around {@link ToolwallOptions.policy}
+     * unless `enable.inference === false`. Exposed so a test can ask the assembled session what a
+     * tool is granted, rather than asking a second policy object nothing enforces.
+     */
+    readonly policy: ResolvedPolicy;
+    /** `undefined` unless `ToolwallOptions.provenance` was supplied. */
+    readonly provenance: ProvenanceObserver | undefined;
     /** The one provider resolving `confirm` verdicts for this session (C-14). */
     readonly confirmationProvider: ConfirmationProvider;
     readonly tools: ToolDefinitionSource;
@@ -352,7 +439,6 @@ const PINNED_RESPONSE_METHODS = [
  */
 export function assembleToolwall(options: ToolwallOptions): Toolwall {
     const era = options.era ?? DEFAULT_PROTOCOL_ERA;
-    const policy = options.policy ?? defaultPolicy();
     const audit = options.audit ?? new AuditLog();
     const enable = options.enable ?? {};
 
@@ -375,6 +461,35 @@ export function assembleToolwall(options: ToolwallOptions): Toolwall {
     const pinScope = options.pinScope ?? DEFAULT_PIN_SCOPE;
     const tools = new PinnedToolDefinitionSource(options.pins, pinScope);
     const sink = audit.sink();
+
+    /**
+     * The capability policy the guards enforce — inferred by default.
+     *
+     * This has to come AFTER `tools`, because inference reads the tool's `inputSchema` and per
+     * contract **C-1** it must read the PINNED one. Handed the live listing it would let a server
+     * widen its own schema and mint itself a capability, which is the rug pull the pin store
+     * exists to stop; handed the pinned one it can only ever describe what was approved.
+     *
+     * Default-ON, on measured evidence rather than on preference (`src/policy/infer.ts` header):
+     * 0.0% false positives against the 0.0% day-zero baseline, and 15/17 (88.2%) capability-abuse
+     * calls caught against 0/17 (0.0%) with no policy file. The bare tier preset declares no roots
+     * and no hosts for any tool, so without this the whole capability layer is inert at day zero —
+     * which `docs/POSITIONING.md` identifies as the product-killer, not a tuning question.
+     *
+     * `observation` is NOT defaulted on here. `inferredPolicy` leaves it `"off"` and nothing below
+     * overrides it: its false-positive cost depends on session shape and has not been measured.
+     *
+     * `enable.inference === false` restores the week-2 behaviour: enforce exactly what the policy
+     * file declares, which at day zero is nothing.
+     */
+    const basePolicy = options.policy ?? defaultPolicy();
+    const policy: ResolvedPolicy =
+        enable.inference === false
+            ? basePolicy
+            : inferredPolicy(basePolicy, tools, {
+                  ...(options.baseDir !== undefined ? { roots: [options.baseDir] } : {}),
+                  ...(options.inference ?? {})
+              });
 
     /**
      * C-14 · ONE confirmation provider for the session.
@@ -428,6 +543,43 @@ export function assembleToolwall(options: ToolwallOptions): Toolwall {
 
     const registeredGuards: string[] = [];
 
+    /*
+     * T-09 provenance — built only when the caller asked for it, and OFF otherwise.
+     *
+     * `provenanceObserver().observe` fires on a `pinned` event whose `serverId` matches the one
+     * derived from the identity, so with `options.serverId` overridden those two ids differ and
+     * `observe` would be silently inert. That is precisely the C-17 failure class, so the override
+     * routes to `checkNow()` rather than quietly doing nothing.
+     */
+    const provenance: ProvenanceObserver | undefined =
+        options.provenance === undefined
+            ? undefined
+            : provenanceObserver({
+                  identity: serverIdentityForSpawn(options.spec),
+                  audit: sink,
+                  provenance: options.provenance,
+                  era,
+                  ...(options.onProvenanceReport !== undefined ? { onReport: options.onProvenanceReport } : {}),
+                  onError: (error: unknown) => {
+                      audit.record({
+                          kind: 'lifecycle',
+                          serverId,
+                          detail: {
+                              event: 'provenance-failed',
+                              error: error instanceof Error ? error.message : String(error)
+                          }
+                      });
+                  }
+              });
+    const observeProvenance: ((event: PinEvent) => void) | undefined =
+        provenance === undefined
+            ? undefined
+            : serverId === upstream.serverId
+              ? provenance.observe
+              : (event: PinEvent) => {
+                    if (event.kind === 'pinned') provenance.checkNow();
+                };
+
     // --- metadata guards (Dev 2) ------------------------------------------
     let pinGuard: MetadataPinGuard | undefined;
     if (enable.pinning !== false) {
@@ -449,6 +601,10 @@ export function assembleToolwall(options: ToolwallOptions): Toolwall {
                         message: event.message
                     }
                 });
+                // T-09: pin time is the moment trust is granted, so it is the moment the
+                // provenance of the package granting it is worth surfacing. Returns immediately;
+                // the guard never awaits it and it can never block a call.
+                observeProvenance?.(event);
                 options.onPinEvent?.(event);
             }
         });
@@ -609,6 +765,8 @@ export function assembleToolwall(options: ToolwallOptions): Toolwall {
         pins: options.pins,
         audit,
         pinGuard,
+        policy,
+        provenance,
         confirmationProvider,
         tools,
         spawnAudit: upstream.audit,
@@ -716,6 +874,43 @@ export type { PinRecord, PinDecision, PinDecisionKind, PinFilter, PinStoreOption
 export { deriveServerId } from './audit/identity.js';
 export type { ServerIdentity, StdioServerIdentity, HttpServerIdentity } from './audit/identity.js';
 
+/*
+ * T-09 provenance. Opt-in and offline by default: `parseProvenanceArgs` sets
+ * `network: NETWORK_ENABLED` if and only if `--verify-provenance` was typed, and `checkProvenance`
+ * makes no request in any other configuration.
+ */
+export {
+    DEFAULT_MAX_RESPONSE_BYTES,
+    DEFAULT_NPM_REGISTRY,
+    DEFAULT_TIMEOUT_MS,
+    NETWORK_ENABLED,
+    PROVENANCE_FLAG,
+    PROVENANCE_RULE_PREFIX,
+    checkProvenance,
+    describeProvenance,
+    parseProvenanceArgs,
+    parseServerJson,
+    provenanceFindings,
+    provenanceObserver,
+    resolvePackageRef,
+    verifyFileSha256
+} from './audit/provenance.js';
+export type {
+    AttestationEvidence,
+    FileHashEvidence,
+    PackageRef,
+    PackageRegistryType,
+    PackageResolution,
+    ProvenanceObserver,
+    ProvenanceObserverOptions,
+    ProvenanceOptions,
+    ProvenanceReport,
+    ResolutionNote,
+    ServerJsonPackage,
+    UnresolvedReason,
+    VerificationDepth
+} from './audit/provenance.js';
+
 export { MetadataPinGuard } from './guards/metadata/drift.js';
 export type { DriftReport, MetadataPinGuardOptions, PinEvent, PinEventKind } from './guards/metadata/drift.js';
 export { CANONICALIZATION_VERSION, canonicalize, canonicalizeAndHash } from './guards/metadata/canonicalize.js';
@@ -744,6 +939,21 @@ export type {
 } from './guards/runtime/confirm.js';
 export { parsePolicy, defaultPolicy } from './policy/parse.js';
 export type { ResolvedPolicy, ParseResult, PolicyError } from './policy/parse.js';
+
+/*
+ * The inferred capability policy — ON by default in `assembleToolwall`, and the reason the
+ * capability layer constrains anything at all before somebody writes a policy file.
+ */
+export { INFERRED_SCHEMES, SessionObserver, exercisedCapabilities, inferProfile, inferredPolicy } from './policy/infer.js';
+export type {
+    CapabilityProfile,
+    InferenceOptions,
+    InferenceReason,
+    InferenceSignal,
+    InferredPolicy,
+    ObservationMode,
+    ObservationWindow
+} from './policy/infer.js';
 export type { AuditSink, ToolDefinition, ToolDefinitionSource } from './policy/contract.js';
 export type { StrictnessTier } from './policy/schema.js';
 

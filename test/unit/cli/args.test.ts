@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { parseArgs, tokenizeCommandLine } from '../../../src/cli/args.js';
+import { USAGE, parseArgs, tokenizeCommandLine } from '../../../src/cli/args.js';
 
 describe('tokenizeCommandLine', () => {
     it('splits on whitespace', () => {
@@ -124,5 +124,51 @@ describe('parseArgs', () => {
         expect(parseArgs(['--reconnect-attempts', 'many', '--server', 'node a.js']).kind).toBe('error');
         expect(parseArgs(['--reconnect-attempts', '-1', '--server', 'node a.js']).kind).toBe('error');
         expect(parseArgs(['--replay-in-flight', 'sometimes', '--server', 'node a.js']).kind).toBe('error');
+    });
+
+    it('turns the inferred capability policy ON by default, and --no-inference off', () => {
+        // Default-ON is the whole Week-3 decision: with no policy file the capability layer
+        // otherwise constrains nothing, and nobody writes policy files.
+        const on = parseArgs(['--server', 'node a.js']);
+        expect(on.kind).toBe('run');
+        if (on.kind !== 'run') return;
+        expect(on.value.inference).toBe(true);
+
+        const off = parseArgs(['--no-inference', '--server', 'node a.js']);
+        expect(off.kind).toBe('run');
+        if (off.kind !== 'run') return;
+        expect(off.value.inference).toBe(false);
+    });
+
+    it('leaves provenance off unless a provenance flag is named', () => {
+        const none = parseArgs(['--server', 'node a.js']);
+        expect(none.kind).toBe('run');
+        if (none.kind !== 'run') return;
+        expect(none.value.provenance, 'the T-09 path must not exist unless asked for').toBe(false);
+
+        for (const argv of [
+            ['--verify-provenance'],
+            ['--provenance-bundle'],
+            ['--provenance-registry', 'https://r.example'],
+            ['--provenance-artifact', './bundle.mcpb'],
+            ['--server-json', './server.json']
+        ]) {
+            const r = parseArgs([...argv, '--server', 'node a.js']);
+            expect(r.kind, `${argv[0]} must be a known option`).toBe('run');
+            if (r.kind !== 'run') return;
+            expect(r.value.provenance, `${argv[0]} must turn the feature on`).toBe(true);
+        }
+    });
+
+    it('rejects a provenance flag whose value is missing rather than swallowing the next flag', () => {
+        expect(parseArgs(['--provenance-registry', '--verbose', '--server', 'node a.js']).kind).toBe('error');
+        expect(parseArgs(['--provenance-artifact', '--verbose', '--server', 'node a.js']).kind).toBe('error');
+        expect(parseArgs(['--server-json', '--verbose', '--server', 'node a.js']).kind).toBe('error');
+    });
+
+    it('the usage text says which single flag makes a network request', () => {
+        expect(USAGE).toContain('--verify-provenance');
+        expect(USAGE).toContain('THIS IS');
+        expect(USAGE).toContain('--no-inference');
     });
 });

@@ -133,6 +133,45 @@ describe("outputSchema enforcement against the pinned definition", () => {
     expect(audited).toEqual([]);
   });
 
+  /* ---------------------------------------------------------------- */
+  /* C-19 · only a tools/call result may pop the tools/call queue        */
+  /* ---------------------------------------------------------------- */
+
+  it("C-19: a resources/read result does not consume the pending tools/call correlation", () => {
+    const audited: Finding[] = [];
+    const g = guard(undefined, audited);
+
+    // One tools/call goes out and is still in flight.
+    g.inspect({ name: "get_forecast", arguments: { city: "Nairobi" } }, req());
+
+    // A resources/read result arrives first. The queue holds outbound tools/calls ONLY, so this
+    // result answers nothing in it. Before the fix it popped the entry anyway.
+    g.inspect({ contents: [{ uri: "file:///x", text: "unrelated" }] }, res("resources/read"));
+
+    // The tools/call result now arrives and MUST still be correlated, so its outputSchema is
+    // enforced. `tempC` is declared `number`; a string is the violation that proves enforcement ran.
+    const v = g.inspect({ content: [], structuredContent: { tempC: "warm" } }, res());
+    expect(v.action).toBe("allow"); // "record" at balanced
+    expect(audited.map((f) => f.ruleId)).toContain("toolwall/result.schema.type");
+    expect(audited.map((f) => f.ruleId)).not.toContain("toolwall/result.uncorrelated");
+  });
+
+  it("C-19: a prompts/get result does not consume it either", () => {
+    const audited: Finding[] = [];
+    const g = guard(undefined, audited);
+    g.inspect({ name: "get_forecast", arguments: { city: "Nairobi" } }, req());
+    g.inspect({ messages: [{ role: "user", content: { type: "text", text: "hi" } }] }, res("prompts/get"));
+    g.inspect({ content: [], structuredContent: { tempC: "warm" } }, res());
+    expect(audited.map((f) => f.ruleId)).toContain("toolwall/result.schema.type");
+  });
+
+  it("C-19: the size and __proto__ checks still run on those results — only correlation is scoped", () => {
+    const g = guard({ servers: { [SERVER]: { response: { bounds: { maxStringLength: 16 } } } } });
+    const v = g.inspect({ contents: [{ uri: "file:///x", text: "x".repeat(4096) }] }, res("resources/read"));
+    expect(v.action).toBe("block");
+    expect(rules(v)).toContain("toolwall/result.bounds.maxStringLength");
+  });
+
   it("declines to guess when several calls are in flight, and says so", () => {
     const audited: Finding[] = [];
     const g = guard(undefined, audited);

@@ -343,23 +343,49 @@ export interface ArgumentShape {
   readonly nodes: number;
 }
 
-/** Single traversal; no serialization. Bounded so measurement itself cannot be weaponized. */
-export function measure(value: unknown, nodeCap = 200_000): ArgumentShape {
+/** {@link ArgumentShape} plus the `__proto__` verdict, from the same single traversal. */
+export interface ScannedShape extends ArgumentShape {
+  /**
+   * `__proto__` appeared as an object key somewhere in the payload.
+   *
+   * `false` when `scanProto` was not requested, and `false` rather than "unknown" when the node cap
+   * cut the walk short — the same fail-open bound the standalone `hasProtoKey` has always had, at
+   * four times the budget because it now shares `measure`'s 200k cap instead of its own 50k one.
+   */
+  readonly protoKey: boolean;
+}
+
+const hasOwn = Object.prototype.hasOwnProperty;
+
+/**
+ * The one traversal.
+ *
+ * Two parallel stacks rather than a stack of `{v, d}` frames: on a 64 KiB result that is one fewer
+ * heap allocation per node, and the node count is exactly the number of values a payload contains.
+ * Bounded, so measurement itself cannot be weaponized (T-08).
+ *
+ * `scanProto` costs one `hasOwnProperty` call per object — O(1), not a second pass, and not a
+ * second `Object.getOwnPropertyNames` allocation. It is deliberately the same test the standalone
+ * `hasProtoKey` performs: a `__proto__` that a JSON parser stored as a real own property. An
+ * inherited accessor is not an own property and does not match, which is the point.
+ */
+function walk(value: unknown, nodeCap: number, scanProto: boolean): ScannedShape {
   let totalBytes = 0;
   let maxStringLength = 0;
   let maxArrayItems = 0;
   let maxObjectProperties = 0;
   let maxDepth = 0;
   let nodes = 0;
+  let protoKey = false;
 
-  const stack: Array<{ v: unknown; d: number }> = [{ v: value, d: 0 }];
-  while (stack.length > 0) {
-    const frame = stack.pop();
-    if (frame === undefined) break;
+  const values: unknown[] = [value];
+  const depths: number[] = [0];
+  while (values.length > 0) {
+    const v = values.pop();
+    const d = depths.pop() as number;
     if (++nodes > nodeCap) break;
-    if (frame.d > maxDepth) maxDepth = frame.d;
+    if (d > maxDepth) maxDepth = d;
 
-    const v = frame.v;
     if (typeof v === "string") {
       if (v.length > maxStringLength) maxStringLength = v.length;
       totalBytes += Buffer.byteLength(v, "utf8");
@@ -368,19 +394,41 @@ export function measure(value: unknown, nodeCap = 200_000): ArgumentShape {
     } else if (Array.isArray(v)) {
       if (v.length > maxArrayItems) maxArrayItems = v.length;
       totalBytes += 2 + v.length;
-      for (const item of v) stack.push({ v: item, d: frame.d + 1 });
-    } else if (typeof v === "object") {
-      const keys = Object.keys(v as object);
+      for (const item of v) {
+        values.push(item);
+        depths.push(d + 1);
+      }
+    } else if (typeof v === "object" && v !== null) {
+      if (scanProto && !protoKey && hasOwn.call(v, "__proto__")) protoKey = true;
+      const keys = Object.keys(v);
       if (keys.length > maxObjectProperties) maxObjectProperties = keys.length;
       totalBytes += 2 + keys.length * 4;
       for (const k of keys) {
         totalBytes += Buffer.byteLength(k, "utf8");
-        stack.push({ v: (v as Record<string, unknown>)[k], d: frame.d + 1 });
+        values.push((v as Record<string, unknown>)[k]);
+        depths.push(d + 1);
       }
     }
   }
 
-  return { totalBytes, maxStringLength, maxArrayItems, maxObjectProperties, maxDepth, nodes };
+  return { totalBytes, maxStringLength, maxArrayItems, maxObjectProperties, maxDepth, nodes, protoKey };
+}
+
+/** Single traversal; no serialization. Bounded so measurement itself cannot be weaponized. */
+export function measure(value: unknown, nodeCap = 200_000): ArgumentShape {
+  return walk(value, nodeCap, false);
+}
+
+/**
+ * Measure the payload AND decide the `__proto__` question in one walk.
+ *
+ * `ResultGuard` needs both on every `tools/call`, `resources/read` and `prompts/get` result, and
+ * running `measure()` then `hasProtoKey()` walked the same bytes twice. On a 64 KiB result that
+ * second walk is where the added-p99 headroom went — `docs/ARCHITECTURE.md` C-11 measured 4.348 ms
+ * against a 5 ms budget and named this as the follow-up.
+ */
+export function measureAndScan(value: unknown, nodeCap = 200_000): ScannedShape {
+  return walk(value, nodeCap, true);
 }
 
 function boundsFindings(shape: ArgumentShape, bounds: ArgumentBounds, toolName: string): Finding[] {

