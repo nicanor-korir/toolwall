@@ -1,0 +1,12 @@
+export * from "./schema.js";
+export * from "./contract.js";
+export { parsePolicy, defaultPolicy, grantForTool } from "./parse.js";
+export type { ResolvedPolicy, ParseResult, ParseOptions, PolicyError } from "./parse.js";
+export { canonicalizePath, canonicalizeRoot, contains, defaultCaseInsensitive, nodeFsProbe } from "./containment.js";
+export type { Canonical, CanonicalizeOptions, FsProbe } from "./containment.js";
+export { evaluateUrl, isIpLiteral, isPrivateAddress } from "./hosts.js";
+export type { UrlDecision } from "./hosts.js";
+export { resolveAnnotations, assessMutation } from "./annotations.js";
+export type { ResolvedAnnotations, MutationAssessment } from "./annotations.js";
+export { collectRoleTargets, deriveUrlSelectors, hasAnyRole } from "./roles.js";
+export type { Role, RoleTarget } from "./roles.js";

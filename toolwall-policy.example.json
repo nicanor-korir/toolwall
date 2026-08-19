@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "tier": "balanced",
+
+  "defaults": {
+    "bounds": {
+      "maxTotalBytes": 4194304,
+      "maxStringLength": 1048576,
+      "maxArrayItems": 5000,
+      "maxObjectProperties": 1024,
+      "maxDepth": 32
+    }
+  },
+
+  "servers": {
+    "filesystem": {
+      "defaults": {
+        "filesystem": {
+          "read": ["/Users/you/projects/my-app"],
+          "write": ["/Users/you/projects/my-app"],
+          "deny": [],
+          "followSymlinksOutOfRoot": false,
+          "allowNonexistent": true
+        }
+      },
+      "tools": {
+        "read_file": { "roles": { "readPath": ["/path"] }, "mutates": false },
+        "read_multiple_files": { "roles": { "readPath": ["/paths/*"] }, "mutates": false },
+        "list_directory": { "roles": { "readPath": ["/path"] }, "mutates": false },
+        "search_files": { "roles": { "readPath": ["/path"] }, "mutates": false },
+        "write_file": { "roles": { "writePath": ["/path"] }, "mutates": true },
+        "edit_file": { "roles": { "writePath": ["/path"] }, "mutates": true },
+        "move_file": {
+          "roles": { "readPath": ["/source"], "writePath": ["/destination"] },
+          "mutates": true
+        }
+      }
+    },
+
+    "git": {
+      "defaults": {
+        "filesystem": {
+          "read": ["/Users/you/projects/my-app"],
+          "write": ["/Users/you/projects/my-app"],
+          "allowNonexistent": true
+        }
+      },
+      "tools": {
+        "git_diff": { "roles": { "readPath": ["/repo_path"] }, "mutates": false },
+        "git_log": { "roles": { "readPath": ["/repo_path"] }, "mutates": false },
+        "git_status": { "roles": { "readPath": ["/repo_path"] }, "mutates": false },
+        "git_add": { "roles": { "writePath": ["/repo_path"] }, "mutates": true },
+        "git_commit": { "roles": { "writePath": ["/repo_path"] }, "mutates": true }
+      }
+    },
+
+    "fetch": {
+      "defaults": {
+        "network": {
+          "hosts": ["api.github.com", "*.githubusercontent.com", "127.0.0.1"],
+          "schemes": ["https"],
+          "allowPrivateNetwork": false,
+          "allowIpLiterals": false
+        }
+      },
+      "tools": {
+        "fetch": { "mutates": false }
+      }
+    },
+
+    "postgres": {
+      "tools": {
+        "query": { "mutates": false },
+        "list_tables": { "mutates": false },
+        "execute": { "mutates": true, "mutation": "confirm" }
+      }
+    }
+  }
+}
