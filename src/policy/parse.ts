@@ -19,6 +19,7 @@ import {
   type ToolwallPolicy,
 } from "./schema.js";
 import { canonicalizeRoot, nodeFsProbe, type FsProbe } from "./containment.js";
+import { ANY_HOST } from "./hosts.js";
 
 /**
  * Parsing and resolution of `toolwall-policy.json`.
@@ -224,6 +225,9 @@ function checkHostList(hosts: unknown, at: string, errors: PolicyError[]): void 
   if (!Array.isArray(hosts)) return;
   for (const [i, h] of hosts.entries()) {
     if (typeof h !== "string") continue;
+    // The single any-host token. Legal, and `parsePolicy` warns about it below, because an operator
+    // who writes it has disabled host matching for that list and should be told so out loud.
+    if (h === ANY_HOST) continue;
     if (h.includes("*") && !h.startsWith("*.")) {
       errors.push({
         at: `${at}/${i}`,
@@ -458,6 +462,16 @@ export function parsePolicy(raw: unknown, opts: ParseOptions = {}): ParseResult 
     if (e.declared && e.enforce !== "off" && e.hosts.length === 0) {
       warnings.push(`servers["${sid}"].egress declares an empty host allowlist: every URL or host argument on this server will be denied.`);
     }
+  }
+  for (const [sid, e] of perServerEgress) {
+    if (e.declared && e.hosts.includes(ANY_HOST)) {
+      warnings.push(
+        `servers["${sid}"].egress.hosts contains "${ANY_HOST}", which matches every host. Only the scheme, IP-literal and private-network checks still apply on that list.`,
+      );
+    }
+  }
+  if (globalEgress.declared && globalEgress.hosts.includes(ANY_HOST)) {
+    warnings.push(`egress.hosts contains "${ANY_HOST}", which matches every host. Only the scheme, IP-literal and private-network checks still apply on that list.`);
   }
   for (const e of [globalEgress, ...perServerEgress.values()]) {
     if (e.enforce === "scan") {

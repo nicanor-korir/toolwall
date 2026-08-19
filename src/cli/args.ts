@@ -3,6 +3,7 @@
  * without spawning anything.
  */
 
+import type { AtrLane } from '../guards/metadata/rules.js';
 import type { StrictnessTier } from '../policy/schema.js';
 import type { ReplayPolicy } from '../transport/reconnect.js';
 import { isProtocolEra, type ProtocolEra } from '../types/protocol.js';
@@ -42,6 +43,17 @@ export interface ParsedArgs {
      * suspected false positive. It turns the product off; the CLI says so on stderr.
      */
     readonly noGuards: boolean;
+    /**
+     * Lane for the advisory `agent-threat-rules` detector, or `undefined` to leave it OFF —
+     * which is the default and the only honest one.
+     *
+     * Measured (`test/unit/atr-fp.test.ts`, printed on every run): the `enforce` lane catches
+     * **0 of 8** published tool-poisoning payloads at 0.0% FP; `alert` catches 5 of 8 at 6.5% FP
+     * on the benign metadata corpus. Neither justifies being on by default, and the verdict is
+     * `allow` regardless of lane — the findings go to the audit log and stderr, nothing is blocked.
+     * The rule pack is a 9.3 MB optional dependency; naming this flag is what installs the cost.
+     */
+    readonly advisoryRules?: AtrLane;
     /**
      * Buffer and retry when the upstream server blips, instead of taking the
      * client session down with it. On by default.
@@ -109,6 +121,14 @@ GUARDS
                           file only; toolwall makes no network calls, ever.
   --no-guards             Bare passthrough, every guard off. This turns the
                           product off. For latency comparison and FP bisection.
+  --advisory-rules <lane> enforce | alert | hunt. Turn ON the advisory
+                          agent-threat-rules detector, which is OFF by default.
+                          It never blocks: matches go to stderr and the audit
+                          log and the verdict stays allow. Measured on this
+                          repo's corpora: enforce catches 0/8 published
+                          payloads, alert catches 5/8 at 6.5% false positives.
+                          Needs the optional agent-threat-rules package
+                          (9.3 MB); startup gets ~1s slower while it loads.
 
 RESILIENCE
   --no-reconnect          Do not buffer and retry when the upstream server
@@ -121,6 +141,11 @@ RESILIENCE
                           the default resends only listing/read methods and
                           answers -32603 for anything that may have side
                           effects. Setting all accepts at-least-once delivery.
+                          Note the honest limit of the default: a hostile
+                          server CAN make resources/read or prompts/get
+                          side-effecting, so read-only-methods accepts
+                          at-most-twice execution of server-side-only effects.
+                          Use none if you do not accept that.
                           A reconnected server is ALWAYS re-verified against
                           the pin store before any buffered request is
                           released; that is not configurable.
@@ -212,6 +237,7 @@ export function parseArgs(argv: readonly string[]): ParseResult {
     let pinMode: PinMode = 'tofu';
     let onUnverifiable: UnverifiableDisposition = 'confirm';
     let noGuards = false;
+    let advisoryRules: AtrLane | undefined;
     let reconnect = true;
     let reconnectAttempts = 3;
     let replayInFlight: ReplayPolicy = 'read-only-methods';
@@ -252,6 +278,14 @@ export function parseArgs(argv: readonly string[]): ParseResult {
             case '--allow-privilege-pivot':
                 allowPrivilegePivots = true;
                 break;
+            case '--advisory-rules': {
+                const value = needsValue(arg, argv[++i]);
+                if (value === null || (value !== 'enforce' && value !== 'alert' && value !== 'hunt')) {
+                    return { kind: 'error', message: '--advisory-rules must be enforce, alert or hunt.' };
+                }
+                advisoryRules = value;
+                break;
+            }
             case '--no-guards':
                 noGuards = true;
                 break;
@@ -417,6 +451,7 @@ export function parseArgs(argv: readonly string[]): ParseResult {
             pinMode,
             onUnverifiable,
             noGuards,
+            ...(advisoryRules !== undefined ? { advisoryRules } : {}),
             reconnect,
             reconnectAttempts,
             replayInFlight

@@ -61,7 +61,7 @@ import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/proto
 import { z } from 'zod';
 
 import type { Finding, GuardContext, GuardDirection, MessageCorrelation, ProtocolEra } from '../types/protocol.js';
-import { DEFAULT_PROTOCOL_ERA, TOOLWALL_INTERNAL_ERROR } from '../types/protocol.js';
+import { DEFAULT_PROTOCOL_ERA, TOOLWALL_INTERNAL_ERROR, sanitizeLocus, sanitizeRenderedText } from '../types/protocol.js';
 import type { GuardPipeline } from './pipeline.js';
 import { DefaultGuardPipeline } from './pipeline.js';
 import {
@@ -150,16 +150,25 @@ export class RelayedRpcError extends Error {
 /**
  * What a blocked finding looks like on the wire to the client.
  *
- * `ruleId`, `severity`, `locus` and `remediation` are written by toolwall and are safe to
- * forward. `message` and `evidence` are NOT: they quote the payload that triggered the block, so
- * on a `tools/list` drift they carry the attacker's injected text verbatim — the very string the
- * block exists to keep away from the model. A JSON-RPC error goes to the LLM client, which
- * routinely surfaces error text to the model, so relaying them would hand the payload to its
- * intended reader through the alarm about it.
+ * `ruleId`, `severity`, `locus` and `remediation` are safe to forward. `message` and `evidence`
+ * are NOT: they quote the payload that triggered the block, so on a `tools/list` drift they carry
+ * the attacker's injected text verbatim — the very string the block exists to keep away from the
+ * model. A JSON-RPC error goes to the LLM client, which routinely surfaces error text to the
+ * model, so relaying them would hand the payload to its intended reader through the alarm about it.
+ *
+ * **`locus` and `remediation` are sanitized rather than trusted, and the original C-9 note that
+ * called all four fields "written by toolwall" was wrong.** A locus is a JSON Pointer *into an
+ * attacker-controlled payload*, so its path segments are names the untrusted side chose, and RFC
+ * 6901 escapes only `~` and `/` — newlines and terminal control sequences pass straight through.
+ * Red team round 2 proved the bypass end to end (`test/attacks/confirm-dialog-injection.test.ts`):
+ * a `format: "uri"` property whose NAME carried fake dialog rows reached both the operator's
+ * `/dev/tty` prompt and this function's output. `remediation` interpolates the same class of
+ * value — a tool name, a denied hostname — for the good reason that a remediation which will not
+ * name the thing to fix is useless. Both now go through `sanitizeLocus` / `sanitizeRenderedText`.
  *
  * The full finding, including the field-level diff a human needs, still goes to `onEvent`
  * (toolwall's stderr under the CLI) and to the audit log. Those are operator channels; this one
- * is not.
+ * is not, and neither is sanitized there — an operator reading a log wants the bytes.
  */
 export interface RedactedFinding {
     readonly ruleId: string;
@@ -175,10 +184,12 @@ const DETAIL_WITHHELD =
 
 export function redactFindingForClient(finding: Finding): RedactedFinding {
     return {
-        ruleId: finding.ruleId,
+        // `ruleId` is namespaced by owner and composed rule packs supply their own, so it is not
+        // ours either. One line, no control characters, like everything else here.
+        ruleId: sanitizeRenderedText(finding.ruleId, 120),
         severity: finding.severity,
-        locus: finding.locus,
-        remediation: finding.remediation,
+        locus: sanitizeLocus(finding.locus),
+        remediation: sanitizeRenderedText(finding.remediation, 600),
         detail: DETAIL_WITHHELD
     };
 }

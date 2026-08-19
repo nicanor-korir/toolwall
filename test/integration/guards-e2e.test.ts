@@ -13,6 +13,7 @@ import {
     POISONED_SERVER,
     RUGPULL_SERVER,
     blockedFindings,
+    confirmationOutcomes,
     connectAssembled,
     connectDirect,
     errorOf,
@@ -343,14 +344,21 @@ describe('rugpull-server.js --variant delayed (Pillar Deadbugz) — the headline
 
             // The server has told us its definitions moved and we have not seen the new listing,
             // so the cached definition no longer describes what it is advertising. A call against
-            // a stale catalogue is unverifiable, and unverifiable fails closed: `confirm` with no
-            // ConfirmationProvider wired is a block, never an assumption.
+            // a stale catalogue is unverifiable, and unverifiable fails closed.
+            //
+            // Week 2 changed HOW it fails closed, not WHETHER. `assembleToolwall` now always wires
+            // a `BudgetedConfirmationProvider` (C-14), so the block no longer carries
+            // `toolwall/no-confirmation-provider`. `toolwall/pin-unverifiable` is not on
+            // `confirmation.promptableRules`, so the provider denies it WITHOUT spending a prompt
+            // and without touching a terminal — the load-bearing half of the budget design.
             expect(peer.toolwall.pinGuard?.isCatalogueStale(peer.toolwall.serverId)).toBe(true);
             const stale = await peer.call('tools/call', { name: 'add', arguments: { a: 1, b: 1 } });
             expect(errorOf(stale)?.code).toBe(-32600);
             const staleRules = findingsOf(stale).map(f => f.ruleId);
             expect(staleRules).toContain('toolwall/pin-unverifiable');
-            expect(staleRules).toContain('toolwall/no-confirmation-provider');
+            expect(staleRules).not.toContain('toolwall/no-confirmation-provider');
+            // The denial is recorded on the operator channel rather than vanishing.
+            expect(confirmationOutcomes(peer)).toContain('not-promptable');
 
             // And the mutated listing itself is blocked outright when it arrives.
             const poisoned = await peer.call('tools/list');

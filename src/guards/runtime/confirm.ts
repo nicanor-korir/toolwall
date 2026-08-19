@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import type { ConfirmationProvider, Finding, GuardContext } from "../../policy/contract.js";
+import { sanitizeLocus, sanitizeRenderedText } from "../../types/protocol.js";
 import type { AuditSink } from "../../policy/contract.js";
 import type { ConfirmationBudget } from "../../policy/schema.js";
 
@@ -22,14 +23,35 @@ import type { ConfirmationBudget } from "../../policy/schema.js";
  *    default: stdin and stdout are the protocol. The only channel is the controlling terminal.
  *  - **Never write to stdout.** Contract C-3. `/dev/tty` or nothing.
  *
- * ## Un-spoofable from the model's side
+ * ## Un-spoofable from the model's side — what that claim is actually worth
  *
- * The prompt is composed exclusively from toolwall-authored fields — `ruleId`, `severity`,
- * `locus`, `remediation` — the same set `redactFindingForClient()` allows across the trust
- * boundary (contract C-9). `finding.message` and `finding.evidence` quote the untrusted server and
- * are **never** rendered here. Otherwise a poisoned tool description would be able to write its
- * own approval dialog: *"[toolwall] routine operation, safe to approve"*. The operator sees our
- * words about the server, never the server's words about itself.
+ * The prompt renders four fields — `ruleId`, `severity`, `locus`, `remediation` — the same set
+ * `redactFindingForClient()` allows across the trust boundary (contract C-9).
+ * `finding.message` and `finding.evidence` quote the untrusted server and are **never** rendered
+ * here. Otherwise a poisoned tool description would write its own approval dialog: *"[toolwall]
+ * routine operation, safe to approve"*.
+ *
+ * **The original version of this note claimed those four fields were "toolwall-authored". They are
+ * not, and red team round 2 proved it** (`test/attacks/confirm-dialog-injection.test.ts`). A
+ * `locus` is a JSON Pointer into an attacker-controlled payload, so its segments are names the
+ * server chose; RFC 6901 escapes only `~` and `/`, so a property name containing newlines rendered
+ * as extra rows of convincing dialog chrome — *"Routine read-only lookup — safe to approve"* —
+ * printed directly above this file's own promise that nothing above came from the server. At a
+ * measured 13.6% human catch rate, a dialog an attacker can write into does not merely leak: it
+ * recruits the rubber stamp.
+ *
+ * The fix is structural rather than lexical, because a lexical one is not available — no escaping
+ * stops a server from naming a property `safe_to_approve`. Every rendered field now goes through
+ * `sanitizeLocus` / `sanitizeRenderedText` (`src/types/protocol.ts`), which guarantees:
+ *
+ *   - **the row count is toolwall's**. No field can contain a newline, so no field can add a row.
+ *   - **the frame is toolwall's**. Box-drawing characters and C0/C1 controls are stripped, so no
+ *     field can redraw the border or move the terminal cursor.
+ *   - **a locus is a path**. Escaped to `[A-Za-z0-9_-./~]`, so it still reads as a pointer a human
+ *     can debug with, and cannot smuggle prose or whitespace-aligned columns.
+ *
+ * What survives is that a server picks the CONTENT of a name inside one row. The closing line of
+ * the dialog says exactly that, rather than the stronger thing it used to say.
  */
 
 export interface ConfirmationChannel {
@@ -176,14 +198,23 @@ export function renderPrompt(findings: readonly Finding[], ctx: GuardContext, re
   const lines: string[] = [];
   lines.push("");
   lines.push("┌─ toolwall · human confirmation required ────────────────────────────");
-  lines.push(`│ server : ${ctx.serverId}`);
-  lines.push(`│ method : ${ctx.method}`);
+  // `serverId` and `method` are ours (derived and validated by the transport), but they go through
+  // the same filter: this template's row count must not depend on the trustworthiness of ANY
+  // caller, including a future one that passes a server-supplied method name straight through.
+  lines.push(`│ server : ${sanitizeRenderedText(ctx.serverId, 80)}`);
+  lines.push(`│ method : ${sanitizeRenderedText(ctx.method, 80)}`);
   for (const f of findings.slice(0, 4)) {
-    lines.push(`│ rule   : ${f.ruleId} [${f.severity}]${f.locus === "" ? "" : ` at ${f.locus}`}`);
-    lines.push(`│          ${f.remediation}`);
+    const locus = sanitizeLocus(f.locus);
+    lines.push(
+      `│ rule   : ${sanitizeRenderedText(f.ruleId, 120)} [${sanitizeRenderedText(f.severity, 12)}]${locus === "" ? "" : ` at ${locus}`}`,
+    );
+    lines.push(`│          ${sanitizeRenderedText(f.remediation, 400)}`);
   }
   lines.push(`│ budget : ${remaining} confirmation${remaining === 1 ? "" : "s"} left this session, then toolwall fails closed.`);
-  lines.push("│ Nothing above is quoted from the server. Approve? [y/N] ");
+  // Precise rather than reassuring. The server picks names; it cannot add a row, redraw this
+  // frame, or write a sentence here.
+  lines.push("│ Nothing above is quoted from the server. Names it chose (property, tool, host)");
+  lines.push("│ appear only escaped to [A-Za-z0-9_-./~] and can never add a line. Approve? [y/N] ");
   lines.push("└─────────────────────────────────────────────────────────────────────");
   return lines.join("\n");
 }

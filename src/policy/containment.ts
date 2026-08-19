@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import * as fs from "node:fs";
+import * as os from "node:os";
 
 /**
  * Canonical path resolution and containment.
@@ -61,6 +62,32 @@ export interface CanonicalizeOptions {
   /** Base directory for relative inputs. Must be absolute. */
   readonly base: string;
   readonly probe?: FsProbe;
+  /** Home directory `~` expands to. Injectable so the check is testable without touching $HOME. */
+  readonly home?: string;
+}
+
+/**
+ * Expand a leading `~` to the home directory.
+ *
+ * **This is a containment fix, not a convenience.** Without it, `~/.ssh/id_rsa` — the single most
+ * frequently used payload in this repository's own attack corpus — is not an absolute path, so it
+ * gets joined onto `baseDir` and canonicalizes to `<workspace>/~/.ssh/id_rsa`, which is *inside*
+ * every granted root. Containment then reports "permitted" for the exact string the attack corpus
+ * exists to describe. The tool on the other side, meanwhile, expands `~` for real: shells do,
+ * Python's `os.path.expanduser` does, Node tooling does. Treating it as a literal directory named
+ * `~` inside the workspace is a fail-OPEN caused by modelling the path differently from the process
+ * that will actually open it.
+ *
+ * Only bare `~` and a leading `~/` (or `~\` on Windows) are expanded. `~otheruser/...` is left
+ * alone deliberately: we cannot resolve another account's home directory without consulting the
+ * password database, and a wrong guess would be a false root. It therefore stays relative and stays
+ * contained — a documented gap, not a covered case.
+ */
+function expandTilde(input: string, home: string | undefined): string {
+  if (input !== "~" && !input.startsWith("~/") && !input.startsWith("~\\")) return input;
+  const h = home ?? os.homedir();
+  if (h === "" || !path.isAbsolute(h)) return input;
+  return input === "~" ? h : h + path.sep + input.slice(2);
 }
 
 export type Canonical =
@@ -113,7 +140,8 @@ export function canonicalizePath(input: unknown, opts: CanonicalizeOptions): Can
   }
 
   const probe = opts.probe ?? nodeFsProbe;
-  const absolute = path.isAbsolute(input) ? input : opts.base + path.sep + input;
+  const expanded = expandTilde(input, opts.home);
+  const absolute = path.isAbsolute(expanded) ? expanded : opts.base + path.sep + expanded;
   const start = splitSegments(absolute);
 
   const root = start.root === "" ? path.sep : start.root;

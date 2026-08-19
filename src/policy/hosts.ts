@@ -45,6 +45,23 @@ export type UrlDecision =
       readonly scheme?: string;
     };
 
+/**
+ * The one token that matches any host: `"*"`.
+ *
+ * It exists for **inferred** policy (`src/policy/infer.ts`), which can read a tool's `format: "uri"`
+ * declaration off the pinned schema but cannot possibly know which hosts your deployment considers
+ * legitimate. Guessing an allowlist would be either useless or an outage, so an inferred network
+ * grant says so explicitly: any host, but only the granted **schemes**, which is what stops
+ * `file:///etc/passwd` and `gopher://…` being handed to a fetch tool.
+ *
+ * It is matched as a WILDCARD, never as an exact entry, so the IP-literal and private-network
+ * checks still apply on top of it — `"*"` disables host matching, not the rest of the allowlist.
+ *
+ * An operator may write it, and `parsePolicy` warns when they do. It is not a wildcard *pattern*:
+ * `"*"` is compared literally, so it cannot be smuggled in as `"*.something"` behaviour.
+ */
+export const ANY_HOST = "*";
+
 /** `*.example.com` matches strict subdomains only; `example.com` must be listed separately. */
 function matchesWildcard(pattern: string, hostname: string): boolean {
   if (!pattern.startsWith("*.")) return false;
@@ -127,8 +144,10 @@ export function evaluateUrl(raw: unknown, grant: HostAllowlist): UrlDecision {
     notes.push("url-contains-userinfo");
   }
 
-  const exact = grant.hosts.some((h) => !h.startsWith("*.") && h.toLowerCase() === hostname);
-  const wildcard = !exact && grant.hosts.some((h) => matchesWildcard(h, hostname));
+  const exact = grant.hosts.some((h) => h !== ANY_HOST && !h.startsWith("*.") && h.toLowerCase() === hostname);
+  // `ANY_HOST` counts as a wildcard match, never an exact one, so the IP-literal and
+  // private-network checks below still run against it.
+  const wildcard = !exact && grant.hosts.some((h) => h === ANY_HOST || matchesWildcard(h, hostname));
 
   if (!exact && !wildcard) {
     return { ok: false, reason: "host-not-granted", detail: hostname, hostname, scheme };

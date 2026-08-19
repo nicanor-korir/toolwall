@@ -57,11 +57,39 @@
  *
  * We will not silently double-execute a side-effecting tool to make a graph look
  * better. Default `replayInFlight: "read-only-methods"` replays only the
- * listing/read methods, whose re-execution is observationally free, and returns
- * `-32603` for the rest with a message that says the execution status is
- * unknown. `"all"` and `"none"` are available for operators who know their
- * server. Note the safe set is keyed on the **method**, never on
- * `annotations.readOnlyHint`, which is attacker-controlled (§1.4).
+ * listing/read methods and returns `-32603` for the rest with a message that
+ * says the execution status is unknown. `"all"` and `"none"` are available for
+ * operators who know their server. Note the safe set is keyed on the
+ * **method**, never on `annotations.readOnlyHint`, which is attacker-controlled
+ * (§1.4).
+ *
+ * The residual risk in that default, stated rather than glossed
+ * ------------------------------------------------------------
+ * This file used to describe the replayed methods as "observationally free".
+ * **That is false against an untrusted peer**, and red team round 2 was right
+ * to call it out. `prompts/get`, `resources/read` and `completion/complete` are
+ * read-only *by contract*, and the contract is the untrusted party's. Nothing
+ * stops a hostile server from incrementing a counter, charging a request, or
+ * advancing an attack state machine inside `resources/read` — the method name
+ * is a promise the server made, not a property toolwall can verify.
+ *
+ * The default nevertheless stands, and the reason is a comparison rather than a
+ * claim of safety:
+ *
+ *   - The blast radius is bounded to what a server does to ITSELF. Re-executing
+ *     `resources/read` cannot spend the user's money or write the user's disk;
+ *     the tool that could is `tools/call`, and `tools/call` is excluded.
+ *   - A server that wants to be re-executed does not need this path. It can
+ *     simply return two results, or crash-loop and be re-read by the client.
+ *     Denying the replay would remove a convenience, not a capability.
+ *   - The alternative default (`"none"`) makes every upstream blip visible to
+ *     the user as a failed listing, which is the behaviour that gets a security
+ *     proxy uninstalled — and an uninstalled proxy enforces nothing.
+ *
+ * So: at-most-twice execution of server-side-only effects is accepted, in
+ * exchange for session continuity, and `--replay-in-flight none` is documented
+ * for operators who do not accept it. What is NOT accepted, at any setting, is
+ * silently repeating a `tools/call`.
  */
 
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
@@ -149,14 +177,20 @@ export function backoffForAttempt(policy: ReconnectPolicy, index: number): numbe
 // ---------------------------------------------------------------------------
 
 /**
- * Methods whose re-execution is observationally free, across both eras.
+ * Methods the SPEC defines as read-only, across both eras — which is not the
+ * same thing as methods whose re-execution is free.
+ *
+ * Read the file header before changing this set. A hostile server can make
+ * `prompts/get` or `resources/read` side-effecting; the method name is its
+ * promise, not our guarantee. The set is drawn this way because the effects it
+ * exposes to double-execution are confined to the server's own state, while
+ * `tools/call` — the method that reaches the user's money, disk and accounts —
+ * is excluded no matter what.
  *
  * This is a *method* allowlist, not an annotation check. `annotations
  * .readOnlyHint` comes from the server and the schema's own doc comment says
  * clients should never make tool-use decisions on it (§1.4) — a server that
  * wanted its side-effecting tool replayed would simply claim `readOnlyHint`.
- * `tools/call` is therefore absent from this set no matter what the tool says
- * about itself.
  */
 const READ_ONLY_METHODS: ReadonlySet<string> = new Set([
     'initialize',

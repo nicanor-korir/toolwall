@@ -192,7 +192,14 @@ describe('the documented invocation, run verbatim', () => {
 
         // Every stdout line parsed as JSON-RPC; the banner and the guard report went to stderr.
         expect(session.stdoutRaw().split('\n').filter(l => l.trim().length > 0)).toHaveLength(session.stdoutLines.length);
-        expect(session.stderr()).toContain('toolwall: guards=[metadata.pin,schema-guard,capability-guard]');
+        // The banner names every control that is actually registered, in registration order.
+        // `result-guard` and `metadata.unicode` landed in Week 2; a banner that still listed three
+        // guards while five were running would be the kind of lie this assertion exists to catch.
+        // `metadata.atr` is absent on purpose: it is opt-in and nothing constructs it here.
+        expect(session.stderr()).toContain(
+            'toolwall: guards=[metadata.pin,metadata.unicode,schema-guard,capability-guard,result-guard]'
+        );
+        expect(session.stderr()).not.toContain('metadata.atr');
     });
 
     it('toolwall --allow-command node -- <cmd> is accepted, and a non-allowlisted binary is refused', async () => {

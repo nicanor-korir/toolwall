@@ -209,6 +209,68 @@ Read the non-zero numbers honestly:
   beyond its published `outputSchema`. Under-specified output schemas are the norm, which is why
   the default is to record rather than block.
 
+## Supply-chain provenance — opt-in, and off unless you ask (T-09)
+
+Two integrity signals are published today, for free, and **nothing in the MCP ecosystem reads
+either of them**:
+
+- **npm SLSA / Sigstore attestations.** The registry returns `dist.attestations` on a package
+  version. Verified 2026-08-19: present on `@modelcontextprotocol/sdk`,
+  `@modelcontextprotocol/server-filesystem` and `@playwright/mcp`; **absent on `mcp-remote`**, the
+  package behind CVE-2025-6514 (RCE, CVSS 9.6). No MCP registry, spec, or client looks at the field.
+- **`server.json` `fileSha256`.** The MCP Registry docs say the registry *"does not validate this
+  hash; however, MCP clients do validate."* Essentially none do.
+
+toolwall reads both, and surfaces the result **at pin time** — the moment you are granting trust to
+a server's tool definitions is the moment "this package ships no build provenance" is worth knowing.
+
+```bash
+# OFF by default. This flag is the only thing that lets toolwall make a network request.
+toolwall --verify-provenance -- npx -y @modelcontextprotocol/server-filesystem ~/work
+
+# also fetch the attestation bundle to read the source repo, commit and CI workflow
+toolwall --verify-provenance --provenance-bundle -- npx -y @playwright/mcp@0.0.41
+
+# fully offline: hash a downloaded artifact against the server.json fileSha256
+toolwall --provenance-artifact ./server.mcpb --server-json ./server.json -- node ./server.js
+```
+
+### What is actually verified — the three claims, kept apart
+
+| Claim | Shipped? |
+|---|---|
+| An attestation **exists** for this version | **Yes** — read from registry metadata |
+| The attestation's in-toto subject digest **matches the tarball** the registry serves | **Yes** — deterministic, trusts no signature |
+| The Sigstore bundle **cryptographically verifies** (Fulcio chain → Rekor inclusion → cert identity → DSSE signature) | **No. Not implemented.** |
+
+So findings say **"attestation present"**, never "attestation verified", and every record carries a
+`verificationDepth` field naming which of the three it was. Presence is a hygiene signal about the
+publisher; it is not an integrity control against a hostile registry, which could simply lie about
+the field. The one check here that earns the word *verified* is the `fileSha256` comparison, because
+it recomputes a hash from bytes on your disk.
+
+### Provenance proves who published a package. It does not prove its tools are honest.
+
+This is the overclaim the whole category is making, so it is worth saying flatly: **a perfectly
+attested, SLSA-v1, trusted-publisher package can ship a tool whose description tells your model to
+read `~/.ssh/id_rsa`.** Provenance is orthogonal to tool poisoning. The `postmark-mcp` backdoor
+(~300 orgs) was published by the legitimate maintainer through the legitimate pipeline — every
+provenance check in toolwall would have returned green on it. Anthropic says the same about its own
+directory: verification *"is not a security audit… The developer operates the connector and controls
+its tools, which can change after review."*
+
+That is what the pinning engine is for, and why provenance sits underneath it rather than instead
+of it.
+
+### Zero network in the default path stays a guarantee
+
+Registry lookups are network calls, so this feature is off unless `--verify-provenance` is passed,
+and there is no configuration short of that flag which enables a request. When it is on and you are
+offline, it **fails open with an explicit finding** — `provenance-not-checked`, worded so that "we
+could not check" can never be read as "we checked and it was fine". Registry responses are treated
+as untrusted input: no free-form registry prose is ever carried into a finding, every field is
+gated against an ASCII shape allowlist, and untrusted input never selects a request target.
+
 ## Principles
 
 - **No account, no telemetry, no network calls** in the default path.
@@ -240,6 +302,10 @@ Two limits specific to what ships today:
   that was already hostile when you first saw it.** Pinning answers "did this change since you
   approved it" with certainty and says nothing about whether the original was safe. `--pin-mode
   strict` is the honest setting for a server you have not reviewed.
+- **Provenance is checked, not cryptographically verified.** toolwall reads npm's attestation
+  metadata; it does not verify the Sigstore bundle offline, so a registry that lies about
+  `dist.attestations` defeats the check. And provenance says who published a package — never that
+  its tools are honest.
 - **`_meta` is not pinned.** It is the designated carrier for transport bookkeeping and changes
   legitimately between two identical listings, so pinning it would trade a narrow coverage gap
   for a broad false-alarm surface. Set `unpinnedFields: []` to pin it and accept the churn.

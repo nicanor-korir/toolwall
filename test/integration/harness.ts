@@ -24,8 +24,9 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { AuditLog } from '../../src/audit/log.js';
 import { PinStore } from '../../src/audit/manifest.js';
 import type { PinEvent } from '../../src/guards/metadata/drift.js';
+import type { ConfirmationChannel, ConfirmationRecord } from '../../src/guards/runtime/confirm.js';
 import type { ResolvedPolicy } from '../../src/policy/parse.js';
-import { assembleToolwall, type GuardToggles, type Toolwall } from '../../src/index.js';
+import { assembleToolwall, type AtrOptions, type GuardToggles, type Toolwall } from '../../src/index.js';
 import type { ReconnectPolicy } from '../../src/transport/reconnect.js';
 import { ToolwallProxy, type ProxyEvent } from '../../src/transport/proxy.js';
 import { createUpstreamStdioTransport } from '../../src/transport/spawn.js';
@@ -38,6 +39,8 @@ export const POISONED_SERVER = path.resolve(here, '../fixtures/malicious/poisone
 export const RUGPULL_SERVER = path.resolve(here, '../fixtures/malicious/rugpull-server.js');
 export const RESTARTING_SERVER = path.resolve(here, '../fixtures/restarting-server.mjs');
 export const MRTR_SERVER = path.resolve(here, '../fixtures/mrtr-server.mjs');
+/** The Week-2 response-leg fixture: egress, outputSchema, ATPA, credential elicitation, unicode. */
+export const RESPONSE_SERVER = path.resolve(here, '../fixtures/response-attacks-server.mjs');
 
 export interface JsonRpcLine {
     readonly raw: string;
@@ -209,6 +212,8 @@ export interface AssembledPeer extends Peer {
     readonly pinEvents: PinEvent[];
     readonly audit: AuditLog;
     readonly pins: PinStore;
+    /** Every confirmation decision this session made (C-14's operator channel). */
+    readonly confirmations: ConfirmationRecord[];
     /** Temp directory holding this session's pin store. Removed by `close()`. */
     readonly dir: string;
     /** Write raw bytes to the client-facing transport, framing and all. For malformed input. */
@@ -237,6 +242,20 @@ export interface AssembledOptions {
      * the session immediately.
      */
     readonly reconnect?: Partial<ReconnectPolicy>;
+    /** Protocol era. Defaults to `2025-11-25`, the era the installed SDK actually speaks. */
+    readonly era?: ProtocolEra;
+    /**
+     * Interactive confirmation channel.
+     *
+     * **Defaults to `null` — no channel — and that default is load-bearing.** `assembleToolwall`
+     * otherwise calls `ttyChannel()`, and a test runner started from a terminal CAN open
+     * `/dev/tty`: a promptable `confirm` verdict would then block the suite for the full
+     * `confirmation.timeoutMs`. Tests that want to exercise approval pass a stub instead.
+     */
+    readonly confirmationChannel?: ConfirmationChannel | null;
+    /** The advisory ATR detector. Off unless a test hands in a scanner, exactly as in production. */
+    readonly atr?: AtrOptions;
+    readonly baseDir?: string;
 }
 
 export async function connectAssembled(options: AssembledOptions = {}): Promise<AssembledPeer> {
@@ -252,6 +271,7 @@ export async function connectAssembled(options: AssembledOptions = {}): Promise<
 
     const events: ProxyEvent[] = [];
     const pinEvents: PinEvent[] = [];
+    const confirmations: ConfirmationRecord[] = [];
 
     const toolwall = assembleToolwall({
         clientTransport: new StdioServerTransport(toProxy, fromProxy),
@@ -266,7 +286,11 @@ export async function connectAssembled(options: AssembledOptions = {}): Promise<
         ...(options.pinMode !== undefined ? { pinMode: options.pinMode } : {}),
         ...(options.onUnverifiable !== undefined ? { onUnverifiable: options.onUnverifiable } : {}),
         ...(options.enable !== undefined ? { enable: options.enable } : {}),
-        baseDir: dir,
+        ...(options.era !== undefined ? { era: options.era } : {}),
+        ...(options.atr !== undefined ? { atr: options.atr } : {}),
+        confirmationChannel: options.confirmationChannel === undefined ? null : options.confirmationChannel,
+        onConfirmation: record => confirmations.push(record),
+        baseDir: options.baseDir ?? dir,
         ...(options.reconnect !== undefined ? { reconnect: options.reconnect } : {}),
         // Every upstream process, including the ones a reconnect spawns, gets its
         // piped stderr drained. An undrained PassThrough eventually blocks the
@@ -297,6 +321,7 @@ export async function connectAssembled(options: AssembledOptions = {}): Promise<
         pinEvents,
         audit,
         pins,
+        confirmations,
         dir,
         async call(method, params) {
             const id = nextId++;
@@ -345,6 +370,46 @@ export function blockedFindings(peer: AssembledPeer): Array<{ ruleId: string; se
     return peer.events
         .filter((e): e is Extract<ProxyEvent, { kind: 'blocked' }> => e.kind === 'blocked')
         .flatMap(e => [...e.findings]) as Array<{ ruleId: string; severity: string; message: string; evidence?: Record<string, unknown> }>;
+}
+
+/**
+ * Rule ids from the `findings` proxy events — the allow-path side channel (contract C-2).
+ *
+ * A guard that returns `allow` cannot carry findings on the verdict, so an informational or
+ * `record`-tier detection is only visible here and in the audit log. Reading it from the client's
+ * response would prove nothing: there is nothing on the client's response to read.
+ */
+export function findingRules(peer: AssembledPeer): string[] {
+    return peer.events
+        .filter((e): e is Extract<ProxyEvent, { kind: 'findings' | 'annotated' | 'blocked' }> =>
+            e.kind === 'findings' || e.kind === 'annotated' || e.kind === 'blocked'
+        )
+        .flatMap(e => e.findings.map(f => f.ruleId));
+}
+
+/** Every finding this session produced, from any proxy event. Operator channel, unredacted. */
+export function allFindings(peer: AssembledPeer): Array<{ ruleId: string; severity: string; message: string; evidence?: Record<string, unknown> }> {
+    return peer.events
+        .filter((e): e is Extract<ProxyEvent, { kind: 'findings' | 'annotated' | 'blocked' }> =>
+            e.kind === 'findings' || e.kind === 'annotated' || e.kind === 'blocked'
+        )
+        .flatMap(e => [...e.findings]) as Array<{ ruleId: string; severity: string; message: string; evidence?: Record<string, unknown> }>;
+}
+
+/** Rule ids recorded in the audit log, which is where `AuditSink` findings land (C-2). */
+export function auditRules(peer: AssembledPeer): string[] {
+    return peer.audit.records.flatMap(r => (r.findings ?? []).map(f => f.ruleId));
+}
+
+/** Outcomes of every confirmation decision this session made (C-14). */
+export function confirmationOutcomes(peer: AssembledPeer): string[] {
+    return peer.confirmations.map(c => c.outcome);
+}
+
+/** The text content of a `tools/call` result line. */
+export function textOf(line: JsonRpcLine): string {
+    const result = line.value['result'] as { content?: Array<{ text?: string }> } | undefined;
+    return (result?.content ?? []).map(c => c.text ?? '').join('');
 }
 
 /** The handshake, byte for byte identical on both paths. */

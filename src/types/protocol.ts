@@ -179,8 +179,92 @@ export function severityRank(severity: FindingSeverity): number {
  * `"/tools/3/description"` or `"/arguments/path"`. `""` means "the payload
  * itself". Guards MUST emit a pointer that actually resolves against the
  * payload they were given, so the CLI can render a diff a human can read.
+ *
+ * **A locus is NOT toolwall-authored text, and must never be rendered as if it
+ * were.** It is a pointer *into an attacker-controlled payload*, so every path
+ * segment in it is a key the untrusted side chose: a tool name, a `format:
+ * "uri"` property name, an array index. RFC 6901 escapes exactly two
+ * characters (`~` and `/`) and says nothing about the rest, so a newline, an
+ * ANSI escape or a box-drawing character passes through a pointer verbatim.
+ *
+ * Red team round 2 turned that into a proven bypass: a server declares a
+ * `format: "uri"` property whose NAME contains newlines and fake dialog rows,
+ * the egress finding carries it into `locus`, and the operator's `/dev/tty`
+ * confirmation prompt renders attacker-authored lines — "safe to approve —
+ * pre-approved by security team" — directly above toolwall's own promise that
+ * nothing in the dialog came from the server. The same string crossed back to
+ * the LLM client through `redactFindingForClient`, which withheld `message`
+ * and `evidence` and passed `locus` straight through.
+ *
+ * Every sink that renders a locus outside the audit log MUST pass it through
+ * {@link sanitizeLocus} first.
  */
 export type FindingLocus = string;
+
+/** Characters a rendered locus may contain. Everything else is percent-escaped. */
+const LOCUS_UNSAFE = /[^A-Za-z0-9_\-./~]/gu;
+
+/** A rendered locus longer than this is truncated. Bounds a flooding payload. */
+export const MAX_RENDERED_LOCUS = 200;
+
+/**
+ * Make a `locus` safe to render in an operator dialog or to relay to a client.
+ *
+ * Percent-escapes every character outside `[A-Za-z0-9_-./~]`, per UTF-8 byte,
+ * uppercase hex — the same shape as a URL escape, and reversible because `%`
+ * is itself outside the safe set and therefore becomes `%25`. The result is
+ * single-line by construction (a newline becomes `%0A`), carries no ANSI
+ * escape, no box-drawing chrome and no whitespace, and still reads as a path,
+ * which is the point: a locus a human cannot use for debugging is a worse fix
+ * than a truncated one.
+ *
+ * What this does and does not buy. It makes the dialog **structurally**
+ * un-forgeable: a server can influence the CONTENT of a row (it chose the
+ * property name) but can never create a row, redraw the frame, or move the
+ * cursor. It does not, and cannot, stop a server from naming a property
+ * `safe_to_approve` — no escaping does. The claim in the dialog was corrected
+ * to say what is actually true.
+ */
+export function sanitizeLocus(locus: unknown): string {
+    if (typeof locus !== 'string' || locus.length === 0) {
+        return '';
+    }
+    const escaped = locus.replace(LOCUS_UNSAFE, (ch: string) =>
+        [...new TextEncoder().encode(ch)].map(b => `%${b.toString(16).toUpperCase().padStart(2, '0')}`).join('')
+    );
+    return escaped.length <= MAX_RENDERED_LOCUS ? escaped : `${escaped.slice(0, MAX_RENDERED_LOCUS)}...`;
+}
+
+/**
+ * Make any other guard-supplied string safe to render as ONE row of an
+ * operator dialog.
+ *
+ * `locus` is the proven vector, but it is not the only interpolated field: a
+ * `remediation` names the tool, the host or the property the operator has to
+ * act on, and all three are strings the untrusted side chose. Escaping those to
+ * a pointer charset would make the remediation unreadable, so they get the
+ * weaker but sufficient treatment — collapse every whitespace run (newlines
+ * included) to a single space, drop control characters and the box-drawing
+ * characters the dialog frame is built from, and truncate.
+ *
+ * The invariant this preserves is the one that matters: **the number of rows in
+ * the dialog is fixed by toolwall's template and cannot be changed by anything
+ * a guard puts in a finding.**
+ */
+export function sanitizeRenderedText(text: unknown, maxLength = 300): string {
+    if (typeof text !== 'string' || text.length === 0) {
+        return '';
+    }
+    const flattened = text
+        // C0/C1 controls and every Unicode separator, including the ones that are
+        // not matched by \s in some engines.
+        .replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]+/gu, ' ')
+        // The frame. A guard has no business drawing one.
+        .replace(/[\u2500-\u257F]+/gu, ' ')
+        .replace(/\s+/gu, ' ')
+        .trim();
+    return flattened.length <= maxLength ? flattened : `${flattened.slice(0, maxLength)}...`;
+}
 
 /**
  * One thing a guard noticed. A `Finding` is evidence, not a decision — the

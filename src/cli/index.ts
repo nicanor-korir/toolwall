@@ -19,7 +19,9 @@ import process from 'node:process';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
 import { parseArgs, USAGE, type ParsedArgs } from './args.js';
-import { assembleToolwall, type Toolwall } from '../index.js';
+import { assembleToolwall, type AtrOptions, type Toolwall } from '../index.js';
+import { AtrScanner } from '../guards/metadata/rules.js';
+import { ttyChannel } from '../guards/runtime/confirm.js';
 import { AuditLog } from '../audit/log.js';
 import { PinStore, PinStoreIntegrityError } from '../audit/manifest.js';
 import { defaultPolicy, parsePolicy, type ResolvedPolicy } from '../policy/parse.js';
@@ -117,6 +119,37 @@ export async function main(argv: readonly string[]): Promise<number> {
         onWriteError: error => err(`toolwall: audit write failed: ${error instanceof Error ? error.message : String(error)}`)
     });
 
+    // The advisory detector, only when the operator named a lane. Loading it is slow (~780 YAML
+    // files) and the package is an optional dependency that may not be installed at all, so the
+    // failure is explained rather than thrown as a module-resolution stack trace: "advisory
+    // detector unavailable" must never look like "toolwall is broken".
+    let atr: AtrOptions | undefined;
+    if (opts.advisoryRules !== undefined) {
+        try {
+            const scanner = await AtrScanner.create({ lane: opts.advisoryRules });
+            atr = { scanner, mode: 'advisory' };
+            err(
+                `toolwall: advisory rules ON, lane=${opts.advisoryRules}, ${scanner.ruleCount} rules loaded. ` +
+                    'This detector NEVER blocks — matches go to stderr and the audit log only.'
+            );
+        } catch (error) {
+            err(`toolwall: --advisory-rules could not start: ${error instanceof Error ? error.message : String(error)}`);
+            return 2;
+        }
+    }
+
+    // C-14: one confirmation channel, opened once, for the life of the session. Opened here rather
+    // than inside `assembleToolwall` so the CLI can say on stderr whether a human can actually be
+    // reached — an operator who thinks confirmation is available when it is not will misread every
+    // fail-closed block that follows.
+    const channel = ttyChannel();
+    if (channel === undefined) {
+        err(
+            'toolwall: no controlling terminal, so nothing can ask you to confirm anything. ' +
+                'Every verdict that needs a human fails closed. This is normal when a client spawned toolwall.'
+        );
+    }
+
     let toolwall: Toolwall;
     try {
         toolwall = assembleToolwall({
@@ -148,7 +181,16 @@ export async function main(argv: readonly string[]): Promise<number> {
                 });
             },
             ...(opts.serverId !== undefined ? { serverId: opts.serverId } : {}),
-            ...(opts.noGuards ? { enable: { pinning: false, schema: false, capability: false } } : {}),
+            ...(opts.noGuards
+                ? { enable: { pinning: false, schema: false, capability: false, result: false, unicode: false } }
+                : {}),
+            ...(atr !== undefined ? { atr } : {}),
+            confirmationChannel: channel ?? null,
+            onConfirmation: record =>
+                err(
+                    `toolwall: confirmation ${record.outcome} for ${record.rule ?? 'an unnamed rule'} ` +
+                        `on ${record.ctx.method} (${record.remaining} left this session)`
+                ),
             onEvent: (event: ProxyEvent) => reportEvent(event, opts.verbose)
         });
     } catch (error) {
@@ -173,7 +215,7 @@ export async function main(argv: readonly string[]): Promise<number> {
         err('toolwall: --no-guards is set. Every control is OFF; this is a bare passthrough and defends nothing.');
     } else {
         err(
-            `toolwall: guards=[${toolwall.registeredGuards.join(',')}] tier=${loaded.policy.tier} pin-mode=${opts.pinMode} on-unverifiable=${opts.onUnverifiable} pins=${pins.path} (${pins.size} pinned)`
+            `toolwall: guards=[${toolwall.registeredGuards.join(',')}] tier=${loaded.policy.tier} pin-mode=${opts.pinMode} on-unverifiable=${opts.onUnverifiable} pins=${pins.path} (${pins.size} pinned) confirm-budget=${loaded.policy.confirmation.maxPrompts}${channel === undefined ? ' (no tty: confirm fails closed)' : ''}`
         );
     }
     const reconnect = toolwall.proxy.reconnectPolicy;

@@ -4,6 +4,7 @@ import { benignCorpus, corpusSummary, corpusToolSource, createWorkspace, egressP
 import { CapabilityGuard } from "../../src/guards/runtime/capability-guard.js";
 import { SchemaGuard } from "../../src/guards/runtime/schema-guard.js";
 import { defaultPolicy, parsePolicy, type ResolvedPolicy } from "../../src/policy/parse.js";
+import { inferredPolicy } from "../../src/policy/infer.js";
 import { TIERS, type StrictnessTier } from "../../src/policy/schema.js";
 import type { AuditSink, Finding, GuardContext, Verdict } from "../../src/policy/contract.js";
 import { isBlocking } from "../../src/policy/contract.js";
@@ -27,14 +28,39 @@ import { isBlocking } from "../../src/policy/contract.js";
  *
  * ## Measured result, 2026-08-19, 59-case corpus (run this file to regenerate)
  *
- * | scenario   | tier       | blocked | confirm | BLOCK RATE | FRICTION RATE |
- * |------------|------------|---------|---------|------------|---------------|
- * | day-zero   | permissive | 0       | 0       | 0.0%       | 0.0%          |
- * | day-zero   | balanced   | 0       | 0       | 0.0%       | 0.0%          |
- * | day-zero   | strict     | 59      | 0       | 100.0%     | 100.0%        |
- * | configured | permissive | 0       | 0       | 0.0%       | 0.0%          |
- * | configured | balanced   | 0       | 0       | 0.0%       | 0.0%          |
- * | configured | strict     | 1       | 27      | 1.7%       | 47.5%         |
+ * | scenario            | tier       | blocked | confirm | BLOCK RATE | FRICTION RATE |
+ * |---------------------|------------|---------|---------|------------|---------------|
+ * | day-zero            | permissive | 0       | 0       | 0.0%       | 0.0%          |
+ * | day-zero            | balanced   | 0       | 0       | 0.0%       | 0.0%          |
+ * | day-zero            | strict     | 59      | 0       | 100.0%     | 100.0%        |
+ * | configured          | permissive | 0       | 0       | 0.0%       | 0.0%          |
+ * | configured          | balanced   | 0       | 0       | 0.0%       | 0.0%          |
+ * | configured          | strict     | 1       | 27      | 1.7%       | 47.5%         |
+ * | **inferred**        | permissive | **0**   | **0**   | **0.0%**   | **0.0%**      |
+ * | **inferred**        | balanced   | **0**   | **0**   | **0.0%**   | **0.0%**      |
+ * | inferred            | strict     | 59      | 0       | 100.0%     | 100.0%        |
+ * | inferred-notmp      | permissive | 1       | 0       | 1.7%       | 1.7%          |
+ * | inferred-notmp      | balanced   | 1       | 0       | 1.7%       | 1.7%          |
+ * | inferred+configured | balanced   | 0       | 0       | 0.0%       | 0.0%          |
+ * | inferred+configured | strict     | 1       | 27      | 1.7%       | 47.5%         |
+ *
+ * **The inference gate (Week 3).** `inferred` at `balanced` is the row that decides whether
+ * inferred capability policy may default ON, and it measures **0.0% blocked / 0.0% friction** —
+ * identical to the day-zero baseline it has to beat. Inference therefore costs nothing on this
+ * corpus while raising the zero-config catch rate from 0.0% to 88.2% (see `infer.test.ts`).
+ *
+ * Two rows are there to price the choices honestly rather than to flatter the number:
+ *
+ *  - **`inferred-notmp` = 1.7% blocked** is the same configuration with `includeTempDir: false`.
+ *    The single block is `fs.sibling-directory-with-shared-prefix`, a legitimate access to a
+ *    directory outside the workspace. So the 0.0% above depends on `os.tmpdir()` being one of the
+ *    inferred roots, and that is a real widening of the grant — stated in `InferenceOptions`, and
+ *    measured here rather than left implicit. Anything outside the workspace and outside the temp
+ *    directory IS blocked at zero configuration, which is the point, and it is also the shape of
+ *    the false positive a user would eventually hit (a second checkout elsewhere on disk).
+ *  - **`inferred` at `strict` is still 100%**, unchanged. Inference infers what a tool may *touch*;
+ *    it does not register the tool, so `strict`'s `unknownTool: "block"` still fires on all 59.
+ *    Inference does not make `strict` usable without a policy file and must not be claimed to.
  *
  * Read those three non-zero numbers honestly:
  *
@@ -58,7 +84,17 @@ interface Outcome {
   readonly findings: readonly Finding[];
 }
 
-type Scenario = "day-zero" | "configured" | "egress-roles" | "egress-scan";
+type Scenario =
+  | "day-zero"
+  | "configured"
+  | "egress-roles"
+  | "egress-scan"
+  /** Day zero PLUS inferred capability policy — no policy file, profiles derived from pinned schemas. */
+  | "inferred"
+  /** Inferred policy with `includeTempDir: false`, to price that option honestly. */
+  | "inferred-notmp"
+  /** The starter policy with inference underneath it — inference as a floor, not a replacement. */
+  | "inferred+configured";
 
 interface Report {
   readonly tier: StrictnessTier;
@@ -154,18 +190,43 @@ function documentFor(scenario: Scenario, tier: StrictnessTier): Record<string, u
     case "egress-scan":
       return { ...egressPolicyDocument(ws, "scan"), tier };
     case "day-zero":
-      throw new Error("day-zero has no document");
+    case "inferred":
+    case "inferred-notmp":
+    case "inferred+configured":
+      throw new Error(`${scenario} has no document`);
   }
 }
 
 function reportFor(tier: StrictnessTier, scenario: Scenario): Report {
   if (scenario === "day-zero") return run(defaultPolicy(tier), tier, scenario);
+  if (scenario === "inferred" || scenario === "inferred-notmp") {
+    // The workspace root stands in for the operator's project directory (`process.cwd()` in
+    // production). Nothing else is configured: no policy file, no declared roots, no host list.
+    const policy = inferredPolicy(defaultPolicy(tier), corpusToolSource(corpus), {
+      roots: [ws.root],
+      includeTempDir: scenario === "inferred",
+    });
+    return run(policy, tier, scenario);
+  }
+  if (scenario === "inferred+configured") {
+    const parsed = parsePolicy({ ...starterPolicyDocument(ws), tier });
+    if (!parsed.ok) throw new Error(`policy failed to parse: ${JSON.stringify(parsed.errors, null, 2)}`);
+    return run(inferredPolicy(parsed.policy, corpusToolSource(corpus), { roots: [ws.root] }), tier, scenario);
+  }
   const parsed = parsePolicy(documentFor(scenario, tier));
   if (!parsed.ok) throw new Error(`policy failed to parse: ${JSON.stringify(parsed.errors, null, 2)}`);
   return run(parsed.policy, tier, scenario);
 }
 
-const SCENARIOS: readonly Scenario[] = ["day-zero", "configured", "egress-roles", "egress-scan"];
+const SCENARIOS: readonly Scenario[] = [
+  "day-zero",
+  "configured",
+  "egress-roles",
+  "egress-scan",
+  "inferred",
+  "inferred-notmp",
+  "inferred+configured",
+];
 
 function pct(n: number): string {
   return `${(n * 100).toFixed(1)}%`;
@@ -233,6 +294,30 @@ describe("false-positive harness (benign corpus)", () => {
     // asks for confirmation on every benign call is a tier the user turns off within a day.
     const r = reportFor("balanced", "day-zero");
     expect(r.frictionRate).toBe(0);
+  });
+
+  it("THE INFERENCE GATE: block and friction are both 0% with inference ON at the default tier, day zero", () => {
+    // The condition on shipping inferred capability policy default-ON. Inference is allowed to
+    // raise the catch rate for free; it is not allowed to cost a single benign call, because the
+    // 0.0% day-zero baseline is the thing that makes the default posture survivable.
+    const r = reportFor("balanced", "inferred");
+    expect(r.outcomes.filter((o) => o.action === "block").map((o) => o.caseId)).toEqual([]);
+    expect(r.outcomes.filter((o) => o.action === "confirm").map((o) => o.caseId)).toEqual([]);
+    expect(r.blockRate).toBe(0);
+    expect(r.frictionRate).toBe(0);
+  });
+
+  it("inference as a floor does not disturb an operator's own policy", () => {
+    const r = reportFor("balanced", "inferred+configured");
+    expect(r.blockRate).toBe(0);
+    expect(r.frictionRate).toBe(0);
+  });
+
+  it("prices includeTempDir honestly: dropping it costs exactly one named benign case", () => {
+    // Recorded as a test so the trade cannot quietly change. If someone tightens the roots, this
+    // is the number they are choosing to pay.
+    const r = reportFor("balanced", "inferred-notmp");
+    expect(r.outcomes.filter((o) => o.action === "block").map((o) => o.caseId)).toEqual(["fs.sibling-directory-with-shared-prefix"]);
   });
 
   it("BLOCK RATE is 0% at the default tier (balanced) once configured", () => {

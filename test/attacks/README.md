@@ -78,3 +78,50 @@ cross-server shadowing / tool-name collision (T-04), malicious-argument fixtures
 (T-08: id collision/cross-talk, oversized/deeply-nested payloads, `__proto__` prototype pollution,
 header↔body desync on the 2026-07-28 mirrored headers), and hostile MRTR / `sampling`·`elicitation`
 server→client payloads. These depend on the proxy existing to attack; the fixtures above do not.
+
+---
+
+## Round 2 (2026-08-19) — Week-2 attack surface
+
+Fired at the reconnect path, confirmation budget, response-leg/MRTR, egress, and scope-keyed pins.
+New files: `confirm-dialog-injection.test.ts`, `atpa-gaps.test.ts`, `round2-boundaries.test.ts`.
+
+### Proven bypass — HITL confirmation dialog is spoofable through `locus` (P2)
+`confirm-dialog-injection.test.ts` (2 asserts, RED). `renderPrompt`/C-14 promise the operator
+"Nothing above is quoted from the server," rendering only ruleId/severity/locus/remediation. But
+`locus` is `/arguments${pointer}` and the pointer embeds a server-chosen `format:uri` property name
+(bound via `deriveUrlFromSchema`, on at the balanced default). JSON Pointer escapes `~` and `/` but
+not newlines, so a property name carrying `\n│ ... safe to approve` prints fake dialog rows above
+the reassurance line. The same unsanitized `locus` also crosses back to the LLM client via
+`redactFindingForClient` (C-9). Reachable under TOFU (first-sighting-malicious pins as-is).
+Owner: `src/guards/runtime/confirm.ts` (renderPrompt) + `src/transport/proxy.ts` (redaction).
+
+### Documented ATPA boundaries, now executable (P3)
+`atpa-gaps.test.ts` (4 tests, GREEN = attack succeeds). ATPA fires only on an immediate same-tool
+retry adding an *undeclared* argument the error text named. It is therefore evaded by: (1) a server
+that DECLARES its exfil argument in the pinned schema; (2) a two-step retry with one interposed
+call (clears the single-slot last-error); (3) routing the exfil retry through a different tool. The
+CONTROL test proves the in-signature shape is blocked. (1) and (2) are acknowledged in the guard
+source; pinned here so the boundary is regression-visible. Owner: `src/guards/runtime/result-guard.ts`.
+
+### Defenses that HELD (stated plainly)
+- **Reconnect gate.** Poisoned generation-2 (tool drift, and instructions drift under 2025-11-25)
+  is refused terminally before the buffer releases; parked requests are not released until reverify
+  completes; a side-effecting `tools/call` is never replayed (method allowlist, not `readOnlyHint`).
+  Honest notes: a hostile server that makes a *read-only method* (`prompts/get`, `resources/read`)
+  side-effecting gets it replayed/double-executed on reconnect — the "re-execution is observationally
+  free" assumption is false for an untrusted peer (documented tradeoff); and reverify force-re-lists
+  `tools/list` but does not re-fetch `server/discover`, so 2026-07-28 instructions-drift on reconnect
+  relies on the client re-discovering rather than being force-checked.
+- **MRTR resultType confusion.** `round2-boundaries.test.ts`. The proxy lift only fires on the exact
+  `resultType:"input_required"`, but `ResultGuard` inspects `inputRequests` inline regardless of
+  resultType/casing/era, so systemPrompt / server-`tools[]` / credential-elicitation detection is not
+  bypassed. `roots/list` carrying a payload is caught too.
+- **Scope-keyed pins.** Scope is operator-set (`pinScope`, default `DEFAULT_PIN_SCOPE`), never derived
+  from anything the server sends, so a server cannot present a mutated definition under a "new scope"
+  to pin fresh instead of drifting.
+- **Egress default.** Off until an operator declares a block, so URL-parsing tricks only engage once
+  configured; the http/url path normalizes decimal/hex/userinfo correctly. One latent bug recorded
+  (`isPrivateAddress` misses the WHATWG-compressed IPv4-mapped IPv6 loopback `[::ffff:7f00:1]`) but it
+  is NOT reachable through `evaluateUrl` — the private check runs only on the wildcard path and an IP
+  literal cannot match a wildcard. Owner: `src/policy/hosts.ts`.

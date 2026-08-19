@@ -239,8 +239,9 @@ error carries the attacker's injected text **verbatim** — and a JSON-RPC error
 client, which routinely surfaces error text to the model. The alarm delivered the payload.
 
 Fixed at the seam: `redactFindingForClient()` sends the client `ruleId`, `severity`, `locus` and
-`remediation` (all toolwall-authored) and withholds `message` and `evidence` (both quote the
-untrusted server). The full finding still reaches `onEvent` — the CLI's stderr — and the audit log,
+`remediation` and withholds `message` and `evidence` (both quote the untrusted server).
+**This paragraph originally called all four "toolwall-authored"; that was wrong for `locus` and
+`remediation`, and C-14a records the bypass it allowed and the sanitization that closes it.** The full finding still reaches `onEvent` — the CLI's stderr — and the audit log,
 which are operator channels. Guard authors may therefore keep writing rich, quoting findings; the
 transport decides what is safe to relay.
 
@@ -322,7 +323,10 @@ identically on the request and response legs. Dev 1 owns that type; nothing was 
   channel for stderr.
 - The budget is per provider instance, i.e. **per session**. Do not construct one per call.
 - It renders only `ruleId` / `severity` / `locus` / `remediation` — the same allowlist as
-  `redactFindingForClient()` (C-9), so a poisoned server cannot compose its own approval dialog.
+  `redactFindingForClient()` (C-9). **Correction, see C-14a:** two of those four are NOT
+  toolwall-authored, and red team round 2 proved a server could forge dialog rows through `locus`.
+  Both sinks now sanitize; the guarantee is that the row count and frame are toolwall's, not that
+  no server-chosen name appears.
 - Rules not on `confirmation.promptableRules` are denied **without** prompting. That is the design,
   not a bug: 86.4% approval on substituted harmful commands means the scarce thing is attention.
 
@@ -338,3 +342,229 @@ RESEARCH-BRIEF §4.2 comes from observing actual traffic and is **not** a number
 That distinction is stated in `src/policy/egress.ts`, in `src/policy/schema.ts`, and in the README
 under both "Egress allowlisting" and "What toolwall does NOT do". Do not let it be dropped from any
 of the four.
+
+---
+
+## Week-2 integration outcomes (2026-08-19) — how the Week-2 contracts were resolved
+
+### C-17 · ITEM ZERO: the whole of Week 2 was dead code in the shipped path — RESOLVED
+`assembleToolwall()` registered exactly three guards: `MetadataPinGuard` → `SchemaGuard` →
+`CapabilityGuard`. `ResultGuard`, `UnicodeHygieneGuard` and `AtrAdvisoryGuard` existed on disk,
+were exported from their barrels, and were covered by passing unit tests. **None of them ran.**
+Every response-leg control — ATPA, MRTR `inputRequests`, credential elicitation, `outputSchema`,
+result bounds, `__proto__` rejection, invisible-character rejection — was unreachable from the
+request path, and nothing failed, because a guard that is never registered raises no error.
+
+This is exactly the failure the integrator mandate names: *a unit test proving a detector works
+does not prove it is wired into the request path.* Two structural changes so it cannot recur:
+
+1. **`assembleToolwall()` throws at assembly time** if `ResultGuard`'s registration count is not
+   the six C-12 requires. A miscount is now a startup crash, not a silent no-op.
+2. **`test/integration/response-guards-e2e.test.ts`** drives every Week-2 control through the
+   assembled proxy against real spawned child processes. A guard that is implemented but not
+   registered fails these tests, as does one registered on the wrong leg.
+
+The startup banner (`toolwall: guards=[...]`) is asserted verbatim in `test/integration/cli.test.ts`,
+so the operator-facing list cannot drift from what is actually registered.
+
+### C-12 · Wired — six registrations, and the count is enforced
+```
+response  tools/call · resources/read · prompts/get      (RESULT_METHODS)
+response  elicitation/create · sampling/createMessage    (SERVER_REQUEST_METHODS, per C-4)
+request   tools/call                                     (correlation + ATPA)
+```
+`ResultGuard` is registered **last** among the `tools/call` request guards. C-12 says order is
+free there, and last is chosen so a call the pin/schema/capability guards blocked is never recorded
+as in-flight for a result that will never arrive.
+
+Proven end to end, not asserted: `outputSchema` violation recorded at `balanced` and blocked at
+`response.outputSchema = "enforce"`; the ATPA retry blocked with the private key never leaving;
+MRTR `systemPrompt` + `tools[]` blocked; credential elicitation refused on the response leg with
+the server receiving the error and the client never seeing a dialog.
+
+### C-13 · Confirmed by wiring, not changed — MRTR routes by embedded method
+`ToolwallProxy.#liftInputRequests` inspects each `inputRequests` entry as
+`("response", <embedded method>)`, so the `sampling/createMessage` and `elicitation/create`
+registrations fire on the live `2025-11-25` server→client request AND on the `2026-07-28` copy
+embedded in a `tools/call` result, with no era branch in any guard. `roots/list` is deliberately
+left unregistered: no guard has a check for it, and the outer `("response","tools/call")`
+registration already records every MRTR input request including `roots/list`.
+
+**The correlation gap C-13 requested of Dev 1 is still open.** `GuardContext` still carries no
+per-exchange id, so `ResultGuard` still declines to enforce `outputSchema` when more than one call
+is in flight, and still emits `toolwall/result.uncorrelated`. Fail-safe, and still a real gap.
+
+### C-14 · Wired — one `BudgetedConfirmationProvider` per session
+Constructed in `assembleToolwall()` from `policy.confirmation` and `ttyChannel()`, once, and passed
+to `DefaultGuardPipeline`. `ttyChannel()` returning `undefined` is passed through unchanged — an
+absent channel is the fail-closed path, not an error. `ToolwallOptions.confirmationChannel` accepts
+`null` to say "non-interactive" explicitly; the integration harness defaults to it, because a test
+runner started from a terminal CAN open `/dev/tty` and a promptable verdict would otherwise block
+the suite for the full timeout.
+
+Observable change: a `confirm` verdict no longer produces `toolwall/no-confirmation-provider`. It
+is now resolved by the provider and denied — `not-promptable` for any rule outside
+`confirmation.promptableRules`, which is the load-bearing half of the budget design. Still a block;
+different finding. `test/integration/guards-e2e.test.ts` asserts the new shape.
+
+### C-14a · The confirmation dialog was server-spoofable — PROVEN BYPASS, FIXED
+Found by red team round 2 (`test/attacks/confirm-dialog-injection.test.ts`).
+
+C-14 and `confirm.ts`'s header both claimed the dialog is composed "exclusively from
+toolwall-authored fields — `ruleId`, `severity`, `locus`, `remediation`". **That claim was false.**
+A `locus` is a JSON Pointer *into an attacker-controlled payload*, so its segments are names the
+untrusted side chose; under `deriveUrlSelectors` (on at the `balanced` default) the URL role binds
+to a `format: "uri"` property whose NAME the server picks, and RFC 6901 escapes only `~` and `/`.
+A property name containing newlines therefore rendered as extra rows of convincing dialog chrome —
+*"Routine read-only lookup — safe to approve"*, *"pre-approved by security team"* — printed
+directly above the dialog's own promise that nothing above came from the server. The same string
+crossed to the LLM client through `redactFindingForClient`, which withholds `message` and
+`evidence` and passed `locus` through untouched. Reachable in the shipped configuration: TOFU pins
+a first-sighting-malicious definition as-is, so no rug pull is needed.
+
+At the measured 13.6% human catch rate this is worse than a leak — a dialog an attacker can write
+into recruits the rubber stamp it was designed to avoid.
+
+Fixed at **both** sinks with one shared pair of functions on the `Finding` contract
+(`src/types/protocol.ts`, so neither `transport/` nor `guards/` depends on the other):
+
+- `sanitizeLocus()` percent-escapes everything outside `[A-Za-z0-9_-./~]`, per UTF-8 byte, and
+  truncates at 200 characters. Single-line by construction, still reads as a pointer.
+- `sanitizeRenderedText()` collapses whitespace runs, strips C0/C1 controls and box-drawing
+  characters, and truncates. Applied to `ruleId` and `remediation` — `remediation` interpolates a
+  tool name and a denied hostname for the good reason that a remediation which will not name the
+  thing to fix is useless.
+
+The invariant is structural rather than lexical, because a lexical one is not available (no
+escaping stops a server naming a property `safe_to_approve`): **the row count and the frame of the
+dialog are toolwall's and cannot be changed by anything a guard puts in a finding.** The dialog's
+closing line now says what is actually true. `redactFindingForClient`'s doc comment, `confirm.ts`'s
+header and the C-9 wording above are corrected accordingly — C-9's "all four written by toolwall"
+was wrong for two of the four.
+
+### C-15 · Wired — nothing hand-rolls a `ResolvedPolicy` in the shipped path
+`assembleToolwall()` takes `ResolvedPolicy` whole from `defaultPolicy()` or `parsePolicy()`, both of
+which supply `egressFor()`, `responseFor()` and `confirmation`. The integration tests build policies
+through `parsePolicy()` for the same reason.
+
+### C-16 · Egress verified end to end, and its FP story verified with it
+Three e2e cases against a real spawned server: a non-allowlisted host **blocked on the request leg**
+before the server ran; an allowlisted host untouched; and — the claim `docs/POSITIONING.md` rests
+on — **no policy file means nothing is denied**, because `enforce: "off"` until an operator declares
+a block is what keeps the day-zero false-positive rate at 0.0%.
+
+The URL role came from the tool's own `format: "uri"`, never from guessing that a property named
+`url` holds one (`evidence.discovery === "role"`).
+
+One honest note: the denied **hostname** does reach the client, inside `remediation` ("add
+`attacker.example` to `servers[...].egress.hosts`"). That is deliberate — an operator cannot act on
+a remediation that will not name the host — and bounded, because the value survived URL parsing and
+so is a syntactically valid hostname that cannot carry prose. It is now also `sanitizeRenderedText`d.
+
+### C-18 · `ToolDefinitionSource.get()` had no scope parameter — RESOLVED
+Raised by Dev 2. Pins are keyed on `(serverId, scope, kind, subject)` and `PinStore.get()` defaults
+`scope` to `DEFAULT_PIN_SCOPE`, so `PinnedToolDefinitionSource` could only ever read the default
+scope. Correct **today**, because scope keying is opt-in and nothing sets a non-default scope — but
+the moment an operator enables it, every lookup returns `undefined` and every call routes into
+`requireKnownSchema`. Fail-safe rather than fail-open, and still a schema layer that has quietly
+stopped enforcing anything.
+
+Closed in two halves, because the scope arrives from two places:
+
+- **Per session.** `ToolDefinitionSource.get(serverId, toolName, scope?)` now takes a scope, and
+  `assembleToolwall({ pinScope })` sets `PinnedToolDefinitionSource.defaultScope` and
+  `MetadataPinGuard.resolveScope` **from the same value**, so the two sides of C-1 cannot drift.
+  A stdio server is launched with one credential and keeps it for the life of the process, which is
+  the realistic case.
+- **Per call.** Still open, and it is Dev 1's to close: `GuardContext` has no authorization field.
+  When the additive `authorizationScope?: string` requested in `MetadataPinGuardOptions.resolveScope`
+  lands, the guards forward `ctx.authorizationScope` into the third parameter and nothing else
+  changes. The parameter is optional, so no existing implementation breaks.
+
+### C-19 · `resources/read` and `prompts/get` results pop the `tools/call` correlation queue — OPEN, Dev 3
+Surfaced by wiring C-12, not by unit tests. `ResultGuard.#onResult()` calls `#correlate(ctx)`
+unconditionally, but `#onResult` now handles all three of `RESULT_METHODS`. A `resources/read`
+result arriving while a `tools/call` is in flight pops the pending `tools/call` entry, so that call's
+result is then uncorrelated and `outputSchema` is silently not enforced against it.
+
+Bounded, and fail-safe: it is unreachable with sequential traffic (the queue is drained by each
+`tools/call` result), and under concurrency the outcome is identical to the gap C-13 already
+documents — the guard declines to enforce and emits `toolwall/result.uncorrelated`. So this widens
+a known gap rather than opening a new one, and it does not change fail-open/fail-closed.
+
+Left for Dev 3 rather than patched across the boundary, because the fix is a one-line guard in an
+actively-edited file and it needs a unit test that only makes sense next to the others:
+```ts
+const correlated = ctx.method === "tools/call" ? this.#correlate(ctx) : undefined;
+```
+
+### C-20 · Replay of "read-only" methods is not free, and the comment said it was — CORRECTED
+`src/transport/reconnect.ts` described the replayed methods as having re-execution that is
+"observationally free". **False against an untrusted peer**, as red team round 2 pointed out:
+`prompts/get`, `resources/read` and `completion/complete` are read-only *by contract*, and the
+contract is the untrusted party's. A hostile server can charge, count or advance a state machine
+inside any of them.
+
+The default `replayInFlight: "read-only-methods"` **stands**, on a comparison rather than a claim of
+safety: the blast radius is confined to what a server does to its own state (`tools/call` — the
+method that reaches the user's money, disk and accounts — is excluded at every setting); a server
+that wants re-execution does not need this path; and the alternative default makes every upstream
+blip a user-visible failure, which is how a security proxy gets uninstalled. What is accepted is
+at-most-twice execution of server-side-only effects, in exchange for session continuity.
+`--replay-in-flight none` is documented for operators who do not accept it. The file header, the
+`READ_ONLY_METHODS` doc comment and the CLI help all now say this.
+
+### C-11 (re-measured) · Latency with the ACTUAL full stack
+Week 1's table measured a **9-byte** echo through request-leg guards only. Week 2 put work on the
+RESULT: `measure()` (bounded 200k nodes) and `hasProtoKey()` each walk every `tools/call`,
+`resources/read` and `prompts/get` result, and `scanSurface()` walks every listing. A 9-byte probe
+hides that entirely, so `bench/latency.ts` now measures **two payload sizes** and reports both.
+
+`npm run bench`, Node v25.2.1 on darwin/x64, 1000 sequential `tools/call` after 100 warmup, one in
+flight. Added latency vs a direct connection, four consecutive runs:
+
+| workload | added p50 | added p95 | added p99 |
+|---|---|---|---|
+| small (9 B) | +0.148 … +0.294 ms | +0.170 … +0.366 ms | +0.225 … +0.483 ms |
+| **large (64 KiB)** | **+0.706 … +0.889 ms** | **+1.065 … +1.772 ms** | **+0.698 … +4.348 ms** |
+
+Guard stack alone (guarded minus zero-guard proxy), so the process hop is excluded:
+
+| workload | p50 | p95 | p99 |
+|---|---|---|---|
+| small | +0.050 … +0.140 ms | +0.038 … +0.185 ms | −0.053 … +0.216 ms |
+| large | +0.057 … +0.263 ms | +0.142 … +0.792 ms | +0.125 … +3.199 ms |
+
+**Within the 5 ms p99 budget on every run — but the Week-1 characterisation "within budget by
+roughly an order of magnitude" no longer holds.** On a 64 KiB result the worst observed added p99
+was **4.348 ms against a 5 ms budget**: about 0.65 ms of headroom, not 4.4 ms. The p50 is stable and
+small; the p99 is where the two full walks of a large payload show up.
+
+Reported honestly rather than filtered: two earlier runs on the same host reported added p99 of
+44.6 ms and 138.4 ms, and are **discarded as host noise, not as toolwall's cost** — the *direct*
+baseline in those runs showed p99 of 24 ms and 87 ms and maxima of 111–264 ms, and the zero-guard
+proxy showed 173 ms. The machine was running three other agents concurrently (`load average 61`).
+The four runs tabulated above were taken on the same host under the same load with maxima of
+2.7–7.2 ms, which is the regime where the deltas mean anything.
+
+Two follow-ups this measurement earns, for Dev 3:
+- `measure()` and `hasProtoKey()` traverse the same payload twice. One fused walk would roughly
+  halve the large-result cost, which is where all the headroom went.
+- Neither walk is needed when `responseFor(serverId).enabled` is false; the early return already
+  covers that, but the bounds check runs unconditionally when it is true, even where every bound is
+  larger than any result the server can produce.
+
+Still not measured, and therefore still not claimed: concurrency, a cold pin store on a slow disk,
+and the `tools/list` cold path.
+
+### C-21 · The advisory ATR detector is opt-in, and there is now a way to opt in
+`AtrAdvisoryGuard` is **never constructed by `assembleToolwall()`**. There is deliberately no
+boolean toggle for it: the caller supplies a pre-built `AtrScanner` via `ToolwallOptions.atr`, or it
+does not exist. The CLI exposes `--advisory-rules <enforce|alert|hunt>`, which is the only way an
+operator gets it, and the banner names it only when it is actually registered.
+
+The measured reason (`test/unit/atr-fp.test.ts`, printed on every test run): the `enforce` lane
+catches **0 of 8** published tool-poisoning payloads at 0.0% FP; `alert` catches 5 of 8 at 6.5% FP.
+Shipping the enforcing lane on by default would block nothing that matters while being loud about
+the rest — theatre. The mode is `advisory` regardless of lane: findings reach stderr and the audit
+log, the verdict stays `allow`.

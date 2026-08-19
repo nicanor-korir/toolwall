@@ -23,6 +23,20 @@
  *     and a string compare per call, not a canonicalize.
  *   - Warmup iterations are discarded to skip JIT and first-call allocation.
  *   - The child process is respawned per configuration, never shared.
+ *
+ * ## Two payload sizes, because Week 2 put work on the RESULT
+ *
+ * Week 1 measured request-leg guards only, so a tiny echo was a fair probe. `ResultGuard` (C-12)
+ * now runs on every `tools/call`, `resources/read` and `prompts/get` RESULT: `measure()` walks the
+ * payload (bounded at 200k nodes) and `hasProtoKey()` walks it again. That cost scales with the
+ * result, and a 9-byte echo would hide it entirely.
+ *
+ * So both sizes are measured:
+ *   small   a 9-byte echo   — the Week-1 probe, kept for comparability with the C-11 table.
+ *   large   a 64 KiB echo   — a realistic `read_file` / query result, where the response-leg walk
+ *                             is actually doing work.
+ * A guard cost that only appears in the `large` row is still a real cost; reporting only `small`
+ * would be choosing the flattering number.
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -192,7 +206,15 @@ const INIT_PARAMS = {
     clientInfo: { name: 'toolwall-bench', version: '0.0.0' }
 };
 
-async function measure(label: string, makeWire: () => Wire | Promise<Wire>): Promise<number[]> {
+/** The two payload sizes. `text` comes back verbatim in the result, so it sizes both legs. */
+const WORKLOADS = [
+    { name: 'small', text: 'benchmark' },
+    { name: 'large', text: 'x'.repeat(64 * 1024) }
+] as const;
+
+type WorkloadName = (typeof WORKLOADS)[number]['name'];
+
+async function measure(label: string, makeWire: () => Wire | Promise<Wire>): Promise<Record<WorkloadName, number[]>> {
     const rpc = new Rpc(await makeWire());
     try {
         await rpc.request('initialize', INIT_PARAMS);
@@ -200,20 +222,26 @@ async function measure(label: string, makeWire: () => Wire | Promise<Wire>): Pro
         // Warm the pin store: a real session lists once and then calls thousands of times.
         await rpc.request('tools/list');
 
-        const params = { name: 'echo', arguments: { text: 'benchmark' } };
-        for (let i = 0; i < WARMUP; i++) await rpc.request('tools/call', params);
+        const out = {} as Record<WorkloadName, number[]>;
+        for (const workload of WORKLOADS) {
+            const params = { name: 'echo', arguments: { text: workload.text } };
+            for (let i = 0; i < WARMUP; i++) await rpc.request('tools/call', params);
 
-        const samples: number[] = new Array<number>(ITERATIONS);
-        for (let i = 0; i < ITERATIONS; i++) {
-            const start = process.hrtime.bigint();
-            const response = await rpc.request('tools/call', params);
-            const end = process.hrtime.bigint();
-            if (response['error'] !== undefined) {
-                throw new Error(`${label}: the benchmarked call was rejected: ${JSON.stringify(response['error'])}`);
+            const samples: number[] = new Array<number>(ITERATIONS);
+            for (let i = 0; i < ITERATIONS; i++) {
+                const start = process.hrtime.bigint();
+                const response = await rpc.request('tools/call', params);
+                const end = process.hrtime.bigint();
+                if (response['error'] !== undefined) {
+                    throw new Error(
+                        `${label}/${workload.name}: the benchmarked call was rejected: ${JSON.stringify(response['error'])}`
+                    );
+                }
+                samples[i] = Number(end - start) / 1e6;
             }
-            samples[i] = Number(end - start) / 1e6;
+            out[workload.name] = samples;
         }
-        return samples;
+        return out;
     } finally {
         await rpc.close();
     }
@@ -248,44 +276,59 @@ function summarize(label: string, samples: number[]): Stats {
 
 const ms = (n: number): string => n.toFixed(3).padStart(8);
 
+const added = (a: Stats, b: Stats): Stats => ({
+    label: `${b.label} - ${a.label}`,
+    p50: b.p50 - a.p50,
+    p95: b.p95 - a.p95,
+    p99: b.p99 - a.p99,
+    mean: b.mean - a.mean,
+    max: b.max - a.max
+});
+
 async function main(): Promise<void> {
     process.stderr.write(
         `toolwall latency benchmark\n` +
             `  node        ${process.version} on ${process.platform}/${process.arch}\n` +
-            `  iterations  ${ITERATIONS} (after ${WARMUP} warmup)\n` +
-            `  method      sequential tools/call, one in flight, same fixture server per config\n\n`
+            `  iterations  ${ITERATIONS} per workload (after ${WARMUP} warmup)\n` +
+            `  method      sequential tools/call, one in flight, same fixture server per config\n` +
+            `  workloads   ${WORKLOADS.map(w => `${w.name} (${w.text.length}B echoed)`).join(', ')}\n\n`
     );
 
-    const direct = summarize('direct', await measure('direct', directWire));
-    const bare = summarize('proxy (0 guards)', await measure('proxy', bareProxyWire));
-    const guarded = summarize('guarded (full stack)', await measure('guarded', guardedWire));
+    const raw = {
+        direct: await measure('direct', directWire),
+        bare: await measure('proxy', bareProxyWire),
+        guarded: await measure('guarded', guardedWire)
+    };
 
-    process.stdout.write(`config                      p50       p95       p99      mean       max\n`);
-    for (const s of [direct, bare, guarded]) {
-        process.stdout.write(`${s.label.padEnd(20)}${ms(s.p50)}  ${ms(s.p95)}  ${ms(s.p99)}  ${ms(s.mean)}  ${ms(s.max)}\n`);
+    let worstAddedP99 = Number.NEGATIVE_INFINITY;
+
+    for (const workload of WORKLOADS) {
+        const direct = summarize('direct', raw.direct[workload.name]);
+        const bare = summarize('proxy (0 guards)', raw.bare[workload.name]);
+        const guarded = summarize('guarded (full stack)', raw.guarded[workload.name]);
+
+        process.stdout.write(`\n== workload: ${workload.name} (${workload.text.length} B echoed) ==\n`);
+        process.stdout.write(`config                      p50       p95       p99      mean       max\n`);
+        for (const s of [direct, bare, guarded]) {
+            process.stdout.write(`${s.label.padEnd(20)}${ms(s.p50)}  ${ms(s.p95)}  ${ms(s.p99)}  ${ms(s.mean)}  ${ms(s.max)}\n`);
+        }
+
+        process.stdout.write(`\nadded latency (same percentile, config minus baseline)\n`);
+        for (const s of [added(direct, bare), added(direct, guarded), added(bare, guarded)]) {
+            process.stdout.write(`${s.label.padEnd(40)}p50 ${ms(s.p50)}  p95 ${ms(s.p95)}  p99 ${ms(s.p99)}\n`);
+        }
+
+        const addedP99 = guarded.p99 - direct.p99;
+        if (addedP99 > worstAddedP99) worstAddedP99 = addedP99;
+        process.stdout.write(`\n${workload.name}: added p99 = ${addedP99.toFixed(3)}ms\n`);
     }
 
-    const added = (a: Stats, b: Stats): Stats => ({
-        label: `${b.label} - ${a.label}`,
-        p50: b.p50 - a.p50,
-        p95: b.p95 - a.p95,
-        p99: b.p99 - a.p99,
-        mean: b.mean - a.mean,
-        max: b.max - a.max
-    });
-
-    process.stdout.write(`\nadded latency (same percentile, config minus baseline)\n`);
-    for (const s of [added(direct, bare), added(direct, guarded), added(bare, guarded)]) {
-        process.stdout.write(`${s.label.padEnd(40)}p50 ${ms(s.p50)}  p95 ${ms(s.p95)}  p99 ${ms(s.p99)}\n`);
-    }
-
-    const addedP99 = guarded.p99 - direct.p99;
-    const verdict = addedP99 <= BUDGET_MS ? 'WITHIN' : 'OVER';
+    const verdict = worstAddedP99 <= BUDGET_MS ? 'WITHIN' : 'OVER';
     process.stdout.write(
         `\nbudget: sub-${BUDGET_MS}ms p99 added overhead, full guard stack vs a direct connection\n` +
-            `result: ${addedP99.toFixed(3)}ms — ${verdict} budget\n`
+            `result: ${worstAddedP99.toFixed(3)}ms (worst workload) — ${verdict} budget\n`
     );
-    if (addedP99 > BUDGET_MS) {
+    if (worstAddedP99 > BUDGET_MS) {
         process.exitCode = 1;
     }
 }

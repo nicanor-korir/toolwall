@@ -109,7 +109,25 @@ export interface ToolDefinition {
  * would let an attacker legalise their own arguments by widening the schema first (T-02).
  */
 export interface ToolDefinitionSource {
-  get(serverId: string, toolName: string): ToolDefinition | undefined;
+  /**
+   * @param scope The authorization context the definition was pinned under (`PinScope` in
+   *   `src/audit/manifest.ts`). Omit it for the default scope.
+   *
+   *   **Why this parameter exists even though no guard passes it yet.** Pins are keyed on
+   *   `(serverId, scope, kind, subject)`: `2026-07-28` says `tools/list` MAY vary by the
+   *   authorization presented, so a token narrowed from `repo:write` to `repo:read` legitimately
+   *   sees a different tool surface. Without the parameter a pin-backed source can only ever read
+   *   the default scope, so the moment scope keying is enabled the lookup returns `undefined` for
+   *   every tool and every call routes into `requireKnownSchema` — fail-safe, not fail-open, but a
+   *   silently unenforceable schema layer either way.
+   *
+   *   `GuardContext` carries no authorization field today (the additive `authorizationScope?`
+   *   requested of Dev 1 in `MetadataPinGuardOptions.resolveScope`), so the guards call this with
+   *   two arguments and the session-wide scope is supplied at construction instead — see
+   *   `PinnedToolDefinitionSource` in `src/index.ts`. When `GuardContext` gains the field, the
+   *   guards pass `ctx.authorizationScope` here and the per-call case closes too.
+   */
+  get(serverId: string, toolName: string, scope?: string): ToolDefinition | undefined;
 }
 
 /** The `params` of a `tools/call` request — the payload a request-leg guard receives. */
