@@ -1,6 +1,6 @@
 {
   "name": "toolwall",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Local-first MCP guardrail proxy. Continuously re-verifies tool definitions before every call to catch rug pulls. No account, no telemetry, no network calls.",
   "keywords": [
     "mcp",

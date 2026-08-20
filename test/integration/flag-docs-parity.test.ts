@@ -1,16 +1,16 @@
 /**
  * **Documentation drift is a support burden, so it is a test failure.**
  *
- * A release audit found the README documenting 11 of the CLI's 28 flags. Nothing was *wrong* —
+ * A release audit found the FLAG_DOCS documenting 11 of the CLI's 28 flags. Nothing was *wrong* —
  * every documented spelling existed — but `--tier`, `--pins`, `--on-unverifiable`, `--no-guards`
  * and thirteen others existed only in `--help`. Two of those are load-bearing for claims the
- * README makes elsewhere: the false-positive tables are indexed by tier and never name `--tier`,
+ * FLAG_DOCS makes elsewhere: the false-positive tables are indexed by tier and never name `--tier`,
  * and the pin-store section gives a path without saying it is relocatable. That is the shape of
  * drift that generates support questions, and it recurs silently unless something checks.
  *
  * So this file checks both directions, and both directions matter for different reasons:
  *
- *   - **Documented but not implemented** is the severe one. A user types what the README says and
+ *   - **Documented but not implemented** is the severe one. A user types what the FLAG_DOCS says and
  *     gets `unknown option`. First-run failure, and a trust problem.
  *   - **Implemented but not documented** is the quiet one. The feature exists, nobody finds it,
  *     and it may as well not have shipped.
@@ -29,16 +29,16 @@ import { describe, expect, it } from 'vitest';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(here, '../..');
 const ARGS = path.join(REPO, 'src/cli/args.ts');
-const README = path.join(REPO, 'README.md');
+const FLAG_DOCS = path.join(REPO, 'docs/configuration.md');
 
-/** The heading that opens the flag reference table in the README. */
+/** The heading that opens the flag reference table in docs/configuration.md. */
 const TABLE_HEADING = '#### Every flag';
 
 /**
  * Flags that the parser accepts but the reference table intentionally omits.
  *
  * Empty, and it should stay that way — an entry here is a promise that a user who reads the
- * README and then types the flag will still be surprised. If something genuinely must be hidden,
+ * FLAG_DOCS and then types the flag will still be surprised. If something genuinely must be hidden,
  * it needs a reason written next to it.
  */
 const INTENTIONALLY_UNDOCUMENTED = new Set<string>([]);
@@ -54,9 +54,9 @@ async function acceptedFlags(): Promise<Set<string>> {
 }
 
 async function documentedFlags(): Promise<Set<string>> {
-    const readme = await readFile(README, 'utf8');
+    const readme = await readFile(FLAG_DOCS, 'utf8');
     const start = readme.indexOf(TABLE_HEADING);
-    expect(start, `README no longer contains a "${TABLE_HEADING}" section`).toBeGreaterThan(-1);
+    expect(start, `FLAG_DOCS no longer contains a "${TABLE_HEADING}" section`).toBeGreaterThan(-1);
 
     // The table runs until the next heading at the same or higher level.
     const rest = readme.slice(start + TABLE_HEADING.length);
@@ -75,14 +75,14 @@ async function documentedFlags(): Promise<Set<string>> {
     return flags;
 }
 
-describe('README flag reference matches the parser', () => {
+describe('FLAG_DOCS flag reference matches the parser', () => {
     it('scrapes a plausible number of flags from both sides', async () => {
         // Guard the guard: if either regex silently stopped matching, every assertion below would
         // pass against two empty sets and prove nothing.
         const accepted = await acceptedFlags();
         const documented = await documentedFlags();
         expect(accepted.size, 'scraped no flags from args.ts — the case-label regex has drifted').toBeGreaterThan(20);
-        expect(documented.size, 'scraped no flags from the README table — its format has drifted').toBeGreaterThan(20);
+        expect(documented.size, 'scraped no flags from the FLAG_DOCS table — its format has drifted').toBeGreaterThan(20);
     });
 
     it('documents no flag that the parser does not accept', async () => {
@@ -91,8 +91,8 @@ describe('README flag reference matches the parser', () => {
         const phantom = [...documented].filter(f => !accepted.has(f)).sort();
         expect(
             phantom,
-            'The README documents flags that src/cli/args.ts does not accept. A user who types one of ' +
-                'these gets "unknown option" on their first run. Fix the README, or implement the flag.'
+            'The FLAG_DOCS documents flags that src/cli/args.ts does not accept. A user who types one of ' +
+                'these gets "unknown option" on their first run. Fix the FLAG_DOCS, or implement the flag.'
         ).toEqual([]);
     });
 
@@ -104,14 +104,14 @@ describe('README flag reference matches the parser', () => {
             .sort();
         expect(
             undocumented,
-            `These flags exist in src/cli/args.ts but appear nowhere in the README's "${TABLE_HEADING}" ` +
+            `These flags exist in src/cli/args.ts but appear nowhere in the FLAG_DOCS's "${TABLE_HEADING}" ` +
                 'table. A feature nobody can find has not shipped. Add a row, or add the flag to ' +
                 'INTENTIONALLY_UNDOCUMENTED with a reason.'
         ).toEqual([]);
     });
 
     it('lists every documented flag in --help too, so the two sources agree', async () => {
-        // `--help` is what a user reaches for when the README is not in front of them. A flag
+        // `--help` is what a user reaches for when the FLAG_DOCS is not in front of them. A flag
         // documented in one place and not the other is still drift, just a cheaper kind.
         const source = await readFile(ARGS, 'utf8');
         const usageStart = source.indexOf('const USAGE');
@@ -122,7 +122,7 @@ describe('README flag reference matches the parser', () => {
         const missingFromUsage = [...documented].filter(f => !usage.includes(f)).sort();
         expect(
             missingFromUsage,
-            'These flags are in the README table but not in the USAGE text that --help prints.'
+            'These flags are in the FLAG_DOCS table but not in the USAGE text that --help prints.'
         ).toEqual([]);
     });
 });
