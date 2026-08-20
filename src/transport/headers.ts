@@ -64,12 +64,20 @@
  *
  * STATUS — SAY THIS PLAINLY
  * -------------------------
- * toolwall ships **no HTTP listener today**; the shipped transport is stdio.
- * This module is the validator that any future Streamable HTTP front door must
- * call before a request reaches policy, and it is exercised by unit tests
- * against the confusion cases rather than by live traffic. It is a complete,
- * tested control that is not yet on a live path — not a control in production.
- * Do not let a README claim otherwise.
+ * **This is now on a live path.** `src/transport/listener.ts` calls
+ * `verifyHeaderBodyAgreement` on every POST before the body reaches the guard
+ * pipeline, and answers `400` with the `-32020` body this file builds when the
+ * two descriptions disagree. Under `2025-11-25`, which mandates no mirroring,
+ * the check runs only when a request actually carries `Mcp-Method`, `Mcp-Name`
+ * or `Mcp-Param-*` — see {@link hasMirroredPolicyHeaders} — and then answers
+ * `-32022`, because policing headers whose correctness nothing requires is the
+ * failure this file exists to prevent, not a service.
+ *
+ * The earlier note here said toolwall shipped no HTTP listener and that this
+ * module had no live consumer. That was true and is no longer; the
+ * classification in `test/integration/wiring-completeness.test.ts` moved from
+ * `exported-only` to `support` in the same change, which is exactly the failure
+ * that check was written to force.
  */
 
 import { MCP_HEADER_MISMATCH, MCP_UNSUPPORTED_PROTOCOL_VERSION } from '../types/protocol.js';
@@ -172,6 +180,30 @@ export function decodeMirroredHeaderValue(raw: string): SentinelDecode {
 
 export type IncomingHeaderValue = string | readonly string[] | undefined;
 export type IncomingHeaders = Readonly<Record<string, IncomingHeaderValue>>;
+
+/**
+ * Does this request carry any header an intermediary would evaluate policy ON?
+ *
+ * `MCP-Protocol-Version` is deliberately NOT one of them: it is sent by every revision from
+ * `2025-03-26` onwards and says nothing about what the request does, so treating its presence as
+ * "the client opted into mirroring" would make every legacy request fail validation.
+ *
+ * The three that ARE policy input are `Mcp-Method`, `Mcp-Name` and `Mcp-Param-*`. A live front
+ * door uses this to decide *whether* to run {@link verifyHeaderBodyAgreement} at all under a
+ * revision that does not mandate mirroring: absent, there is nothing to disagree with the body and
+ * the request is judged on its body alone; present, they must be checked, and under a revision
+ * with no mirroring obligation the honest answer is `-32022` — we will not police headers whose
+ * correctness nothing requires.
+ */
+export function hasMirroredPolicyHeaders(headers: IncomingHeaders): boolean {
+    for (const key of Object.keys(headers)) {
+        const lower = key.toLowerCase();
+        if (lower === HEADER_METHOD || lower === HEADER_NAME || lower.startsWith(HEADER_PARAM_PREFIX)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 export interface HeaderViolation {
     readonly ruleId: string;

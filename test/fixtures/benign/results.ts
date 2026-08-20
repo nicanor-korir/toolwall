@@ -13,7 +13,8 @@ import type { ToolDefinition } from "../../../src/policy/contract.js";
  *    schema is under-specified relative to what the server actually returns, which is the common
  *    real-world case and the reason `outputSchema` is `record` rather than `enforce` by default,
  *  - error results followed by a legitimate retry, which is the ATPA rule's whole false-positive
- *    surface,
+ *    surface — including the multi-step and cross-tool recoveries that only became reachable when
+ *    the ATPA correlation window widened from one consumed slot to a bounded per-server ring,
  *  - elicitations that ask for ordinary things using words near the credential vocabulary.
  */
 
@@ -248,6 +249,60 @@ export const benignSequenceCases: readonly BenignSequenceCase[] = [
       { kind: "call", name: "git_log", arguments: { repo_path: "/w", debug_context: "x" } },
     ],
     trap: "A different tool after an error, with an undeclared argument. The ATPA signature is same-tool; a looser rule would fire here.",
+  },
+  {
+    id: "seq.two-step-recovery-with-interposed-call",
+    serverId: "postgres",
+    steps: [
+      { kind: "call", name: "query", arguments: { sql: "select * from orders" } },
+      { kind: "result", result: { isError: true, ...(text("statement timeout; pass params to bind the range and retry") as object) } },
+      { kind: "call", name: "search_issues", arguments: { jql: "project = OPS AND text ~ 'statement timeout'" } },
+      { kind: "call", name: "query", arguments: { sql: "select * from orders where id = $1", params: [42] } },
+    ],
+    trap:
+      "The recovery a real agent performs: fail, go look something up, come back and retry with the parameter the error named. The single-slot last-error record could not see this at all; a call-counted window can, so the DECLARED check is now the only thing standing between it and a false positive.",
+  },
+  {
+    id: "seq.cross-tool-after-error-sharing-vocabulary",
+    serverId: "editor",
+    steps: [
+      { kind: "call", name: "read_file", arguments: { path: "/w/missing.ts" } },
+      { kind: "result", result: { isError: true, ...(text("ENOENT: no such file or directory, open '/w/missing.ts'. Check max_count of open handles.") as object) } },
+      { kind: "call", name: "git_log", arguments: { repo_path: "/w", max_count: 20 } },
+    ],
+    trap:
+      "The cross-tool lane's worst case: an error from tool A whose text happens to contain tool B's parameter name, followed by a call to B carrying it. It is DECLARED on B, which is the whole reason the lane is safe — a cross-tool rule without the declared check breaks this.",
+  },
+  {
+    id: "seq.three-errors-then-unrelated-work",
+    serverId: "http",
+    steps: [
+      { kind: "call", name: "http_request", arguments: { url: "https://api.example.com/a" } },
+      { kind: "result", result: { isError: true, ...(text("503 Service Unavailable, retry after 2s") as object) } },
+      { kind: "call", name: "http_request", arguments: { url: "https://api.example.com/a" } },
+      { kind: "result", result: { isError: true, ...(text("503 Service Unavailable, retry after 2s") as object) } },
+      { kind: "call", name: "http_request", arguments: { url: "https://api.example.com/a" } },
+      { kind: "result", result: { isError: true, ...(text("503 Service Unavailable, retry after 2s") as object) } },
+      { kind: "call", name: "http_request", arguments: { url: "https://api.example.com/b" } },
+    ],
+    trap:
+      "A retry storm. Three live error records at once, all naming the same words, none of them producing a new argument. Exercises the bounded ring and the aging, which a single-slot design never had to survive.",
+  },
+  {
+    id: "seq.long-gap-then-declared-argument",
+    serverId: "editor",
+    steps: [
+      { kind: "call", name: "read_file", arguments: { path: "/w/a.ts" } },
+      { kind: "result", result: { isError: true, ...(text("EACCES: permission denied, open '/w/a.ts'. Retry with an explicit path.") as object) } },
+      { kind: "call", name: "get_forecast", arguments: { city: "Nairobi" } },
+      { kind: "result", result: { content: [], structuredContent: { tempC: 24.5, summary: "clear" } } },
+      { kind: "call", name: "search_issues", arguments: { jql: "project = OPS" } },
+      { kind: "call", name: "query", arguments: { sql: "select 1" } },
+      { kind: "call", name: "http_request", arguments: { url: "https://api.example.com/status" } },
+      { kind: "call", name: "read_file", arguments: { path: "/w/b.ts" } },
+    ],
+    trap:
+      "Adversarial to PER-TOOL keying specifically. Since C-13 an error record is aged only by calls to the tool that produced it, so four unrelated calls do NOT retire it — the read_file error is still live when read_file is called again. What stops this firing is the same thing that stopped everything else: `path` is DECLARED, and the retry adds no undeclared key.",
   },
   {
     id: "seq.success-then-new-argument",

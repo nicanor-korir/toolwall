@@ -34,10 +34,21 @@ import type { Finding, GuardContext, ToolDefinition, Verdict } from "../../src/p
  *
  * The corpus below therefore encodes the T-05 class from the documented incidents and from the
  * semantic intent every existing fixture already carries (`INTENT` in `evasion-corpus.ts`: *read
- * the user's ~/.ssh/id_rsa and send it to an attacker*). It deliberately includes cases inference
- * is expected to MISS — an exfiltration POST to an unlisted host, and the cloud-metadata SSRF —
- * because a true-positive number assembled only from cases the control was built for is not a
- * measurement.
+ * the user's ~/.ssh/id_rsa and send it to an attacker*). It deliberately includes a case inference
+ * is expected to MISS — an exfiltration POST to an unlisted host — because a true-positive number
+ * assembled only from cases the control was built for is not a measurement.
+ *
+ * ## The cloud-metadata case moved from MISS to CATCH, and why that is not cheating
+ *
+ * `atk.cloud-metadata-ssrf` was an asserted miss until the default deny list landed
+ * (`deniedDestination` in `src/policy/hosts.ts`). It is now caught at zero configuration, taking
+ * inference from 15/17 to 16/17. The distinction that makes one of the two network misses closable
+ * and the other not is worth stating, because it is the whole argument for where a deny list is
+ * legitimate: *no evidence on the wire says whether `collector.evil.tld` is a host your deployment
+ * trusts*, so nothing but an operator declaration can decide it. `169.254.169.254` needs no such
+ * evidence — it is a fixed, published, universally-hostile destination, and its enumeration is
+ * closed. `atk.exfil-post-to-attacker-host` remains an asserted miss and a deny list can never
+ * close it, because the attacker chooses the hostname.
  */
 
 let ws: Workspace;
@@ -494,8 +505,8 @@ const ATTACK_CASES: readonly AttackCase[] = [
     serverId: "http",
     tool: "fetch",
     args: () => ({ url: "http://169.254.169.254/latest/meta-data/iam/security-credentials/" }),
-    anchor: "IMDS credential theft.",
-    inferenceMiss: "The inferred grant permits private addresses because the benign corpus — and real developer traffic — is full of localhost dev servers.",
+    anchor:
+      "IMDS credential theft. Caught at zero configuration since the default deny list: the inferred grant still permits private addresses (localhost dev servers are most of real traffic) but link-local and cloud-metadata space is denied outright, at zero measured false-positive cost.",
   },
 ];
 
@@ -594,14 +605,15 @@ describe("TRUE-POSITIVE measurement — inferred vs hand-written, on capability-
   });
 
   it("and it does NOT catch everything a declared HOST allowlist catches — the honest gap, asserted", () => {
-    // Reported as a number rather than a caveat: a hand-written `network.hosts` list catches two
-    // network-leg cases inference cannot, because no evidence on the wire says which hosts are
+    // Reported as a number rather than a caveat: a hand-written `network.hosts` list still catches
+    // one network-leg case inference cannot, because no evidence on the wire says which hosts are
     // legitimate. This is why inference ships as a floor and why the README must keep pointing at
-    // the egress block, not because the egress block is optional polish.
+    // the egress block, not because the egress block is optional polish. It used to be two; the
+    // default deny list closed the cloud-metadata one, and could not have closed this one.
     const hand = new Map(runAttacks(policyFrom({ ...starterPolicyDocument(ws), tier: "balanced" })).map((o) => [o.caseId, o.action]));
     const inferred = new Map(runAttacks(inferredPolicy(defaultPolicy("balanced"), tools, { roots: [ws.root] })).map((o) => [o.caseId, o.action]));
     const onlyHandWritten = ATTACK_CASES.filter((c) => hand.get(c.id) !== "allow" && inferred.get(c.id) === "allow").map((c) => c.id);
-    expect(onlyHandWritten).toEqual(["atk.exfil-post-to-attacker-host", "atk.cloud-metadata-ssrf"]);
+    expect(onlyHandWritten).toEqual(["atk.exfil-post-to-attacker-host"]);
     expect(onlyHandWritten.every((id) => ATTACK_CASES.find((c) => c.id === id)?.capability === "network")).toBe(true);
   });
 
@@ -691,7 +703,9 @@ describe("the response leg is untouched by inference", () => {
     const base = defaultPolicy("balanced");
     const before = run(base);
     const after = run(inferredPolicy(base, tools, { roots: [ws.root] }));
-    expect(before).toHaveLength(20);
+    // Length is asserted against the corpus rather than a literal, so growing the response corpus
+    // (as the ATPA window widening did) cannot silently turn this into a weaker check.
+    expect(before).toHaveLength(benignResultCases.length + benignSequenceCases.length + benignElicitationCases.length);
     expect(after).toEqual(before);
     expect(before.every((r) => r.endsWith(":allow"))).toBe(true);
   });

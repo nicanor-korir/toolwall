@@ -86,6 +86,14 @@ export interface NetworkGrant {
   readonly allowPrivateNetwork: boolean;
   /** Whether bare IP literals (v4/v6) are acceptable hosts at all. */
   readonly allowIpLiterals: boolean;
+  /**
+   * Permit cloud instance-metadata endpoints and link-local address space. **Default `false`, and
+   * it stays `false` even in an inferred grant**, which is the whole point: `allowPrivateNetwork`
+   * and `allowIpLiterals` are both `true` there so that `http://127.0.0.1:3000` keeps working, and
+   * this is the one destination class that gets denied anyway. See `deniedDestination` in
+   * `src/policy/hosts.ts` for what is on the list and what is deliberately not.
+   */
+  readonly allowMetadataEndpoints: boolean;
 }
 
 export type MutationDisposition = "deny" | "confirm" | "allow";
@@ -251,6 +259,8 @@ export interface EgressPolicy {
   readonly schemes: readonly string[];
   readonly allowPrivateNetwork: boolean;
   readonly allowIpLiterals: boolean;
+  /** See `NetworkGrant.allowMetadataEndpoints`. Default `false` — cloud IMDS is denied outright. */
+  readonly allowMetadataEndpoints: boolean;
   /** What a violation costs. `"confirm"` spends from the confirmation budget — see `ConfirmationBudget`. */
   readonly onViolation: "block" | "confirm" | "allow";
 }
@@ -262,6 +272,7 @@ const EGRESS_UNDECLARED: EgressPolicy = {
   schemes: ["https"],
   allowPrivateNetwork: false,
   allowIpLiterals: false,
+  allowMetadataEndpoints: false,
   onViolation: "block",
 };
 

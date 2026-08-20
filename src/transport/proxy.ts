@@ -107,6 +107,18 @@ const PassthroughResultSchema = z.unknown();
  */
 export const NO_PROXY_TIMEOUT_MS = 2_147_483_647;
 
+/**
+ * A `MessageCorrelation` whose `correlationId` is known to be present —
+ * contract **C-13**.
+ *
+ * `MessageCorrelation.correlationId` is optional in the public type so that a
+ * caller outside the request path (a unit test, `provenanceObserver`) can build
+ * one without inventing a pairing key. Inside this file it is not optional, and
+ * this alias is what makes the compiler say so: every context the proxy hands a
+ * guard carries an id a result can be matched back to its request with.
+ */
+type ProxyCorrelation = MessageCorrelation & { readonly correlationId: string };
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -559,10 +571,19 @@ export class ToolwallProxy {
     // Relay
     // -----------------------------------------------------------------------
 
-    #context(direction: GuardDirection, method: string, correlation?: MessageCorrelation): GuardContext {
-        if (correlation === undefined) {
-            return { era: this.era, serverId: this.serverId, direction, method };
-        }
+    /**
+     * Build a `GuardContext`.
+     *
+     * `correlation` is a **required** parameter, not an optional one — contract
+     * C-13. Every payload the proxy hands a guard belongs to some round trip, and
+     * a leg that quietly passed `undefined` is precisely how a result stopped
+     * being matchable to its request. Making the compiler ask the question at
+     * every call site is the cheapest available guarantee that no leg is missed;
+     * `test/integration/correlation.test.ts` checks the same thing at runtime,
+     * across real traffic, because a future call site could still pass a
+     * correlation whose id is empty.
+     */
+    #context(direction: GuardDirection, method: string, correlation: ProxyCorrelation): GuardContext {
         return { era: this.era, serverId: this.serverId, direction, method, correlation };
     }
 
@@ -575,12 +596,19 @@ export class ToolwallProxy {
      * it is not a retry (or the era has no MRTR) this mints a fresh exchange id
      * so `correlation.exchangeId` is always present and a guard never has to
      * branch on its absence.
+     *
+     * `correlationId` is minted fresh in **both** arms. A retry is a new round
+     * trip that continues an old exchange, so it keeps the `exchangeId` and takes
+     * a new pairing key; reusing the pairing key would mean two live round trips
+     * sharing one, which is the ambiguity C-13 exists to remove.
      */
-    #correlateClientRequest(request: JSONRPCRequest): MessageCorrelation {
+    #correlateClientRequest(request: JSONRPCRequest): ProxyCorrelation {
+        const correlationId = this.#correlator.mintCorrelationId();
         if (eraUsesMrtr(this.era)) {
             const retry = this.#correlator.correlateRetry(request.params);
             if (retry !== undefined) {
                 return {
+                    correlationId,
                     exchangeId: retry.exchangeId,
                     requestId: request.id,
                     requestStateHash: retry.requestStateHash,
@@ -588,7 +616,26 @@ export class ToolwallProxy {
                 };
             }
         }
-        return { exchangeId: this.#correlator.mint(), requestId: request.id };
+        return { correlationId, exchangeId: this.#correlator.mint(), requestId: request.id };
+    }
+
+    /**
+     * Correlation for a message toolwall relays or originates that is not a
+     * client->server request: a notification in either direction, a server->client
+     * request, and the synthetic re-verification traffic after a reconnect.
+     *
+     * A notification has no response leg and no JSON-RPC id, so its correlation
+     * pairs with nothing. It is minted anyway: a guard that has to ask "is there
+     * a correlation here?" before reading one has the branch C-13 was supposed to
+     * delete, and "present but pairs with nothing" is a cheaper thing to reason
+     * about than "sometimes absent".
+     */
+    #freshCorrelation(extra: Omit<MessageCorrelation, 'correlationId' | 'exchangeId'> = {}): ProxyCorrelation {
+        return {
+            correlationId: this.#correlator.mintCorrelationId(),
+            exchangeId: this.#correlator.mint(),
+            ...extra
+        };
     }
 
     /**
@@ -701,7 +748,7 @@ export class ToolwallProxy {
             // A server->client request travels *towards the client*, so it is
             // inspected on the "response" leg: everything from the server is
             // attacker-controlled data (THREAT-MODEL §0).
-            const correlation: MessageCorrelation = { exchangeId: this.#correlator.mint(), requestId: request.id };
+            const correlation = this.#freshCorrelation({ requestId: request.id });
             const outboundCtx = this.#context('response', request.method, correlation);
             const params = await this.#applyGuards(request.params, outboundCtx);
 
@@ -742,7 +789,7 @@ export class ToolwallProxy {
      * actually returned a replacement, in which case only the touched entries
      * are rebuilt.
      */
-    async #liftInputRequests(result: unknown, outerMethod: string, correlation: MessageCorrelation): Promise<unknown> {
+    async #liftInputRequests(result: unknown, outerMethod: string, correlation: ProxyCorrelation): Promise<unknown> {
         if (!eraUsesMrtr(this.era)) {
             return result;
         }
@@ -760,6 +807,7 @@ export class ToolwallProxy {
                 'response',
                 entry.method,
                 correlationForEmbedded({
+                    correlationId: correlation.correlationId,
                     exchangeId: correlation.exchangeId,
                     outerMethod,
                     ...(correlation.requestId !== undefined ? { requestId: correlation.requestId } : {}),
@@ -792,7 +840,9 @@ export class ToolwallProxy {
     }
 
     async #relayNotification(notification: Notification, direction: GuardDirection): Promise<void> {
-        const ctx = this.#context(direction, notification.method);
+        // C-13: a notification pairs with nothing, and still gets a correlation
+        // id. See `#freshCorrelation`.
+        const ctx = this.#context(direction, notification.method, this.#freshCorrelation());
         let params: unknown;
         try {
             params = await this.#applyGuards(notification.params, ctx);
@@ -963,7 +1013,7 @@ export class ToolwallProxy {
         if (this.era !== '2025-11-25' || this.#capturedInitialize === undefined) {
             return;
         }
-        const correlation: MessageCorrelation = { exchangeId: this.#correlator.mint(), synthetic: true };
+        const correlation = this.#freshCorrelation({ synthetic: true });
         const result = await this.#client.request(
             buildOutboundRequest('initialize', this.#capturedInitialize.params),
             PassthroughResultSchema,
@@ -1004,7 +1054,7 @@ export class ToolwallProxy {
         if (!this.#reconnect.reverifyOnReconnect) {
             return;
         }
-        const correlation: MessageCorrelation = { exchangeId: this.#correlator.mint(), synthetic: true };
+        const correlation = this.#freshCorrelation({ synthetic: true });
 
         // 1. invalidate whatever the previous process taught the guards.
         const staleCtx = this.#context('response', 'notifications/tools/list_changed', correlation);

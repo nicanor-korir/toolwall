@@ -5,6 +5,7 @@
 
 import type { AtrLane } from '../guards/metadata/rules.js';
 import type { StrictnessTier } from '../policy/schema.js';
+import { DEFAULT_LISTEN_HOST, splitAuthority } from '../transport/http.js';
 import type { ReplayPolicy } from '../transport/reconnect.js';
 import { isProtocolEra, type ProtocolEra } from '../types/protocol.js';
 
@@ -87,6 +88,24 @@ export interface ParsedArgs {
      * `src/transport/reconnect.ts`.
      */
     readonly replayInFlight: ReplayPolicy;
+    /**
+     * Serve the client leg over Streamable HTTP instead of stdio.
+     *
+     * `undefined` means stdio, which is the default and stays the default. Present means a
+     * loopback HTTP listener with a mandatory bearer token — see `src/transport/listener.ts` for
+     * why every part of that sentence is load-bearing.
+     */
+    readonly listen?: ListenOptions;
+}
+
+/** `--listen` and its modifiers. Only constructed when `--listen` was actually named. */
+export interface ListenOptions {
+    readonly host: string;
+    readonly port: number;
+    readonly path: string;
+    /** From `--listen-token`. Absent means one is generated and printed on stderr. */
+    readonly token?: string;
+    readonly allowedOrigins: readonly string[];
 }
 
 export type ParseResult =
@@ -179,6 +198,43 @@ PROVENANCE (T-09) — OFF unless you name one of these
   --provenance-artifact <path>  Local artifact (.mcpb / tarball) to hash against
                           that fileSha256. Offline; no network involved.
 
+HTTP (Streamable HTTP, RFC-shaped per --era)
+  --listen [host:port]    Serve the CLIENT leg over Streamable HTTP instead of
+                          stdio. Default 127.0.0.1:0 (the OS picks a port,
+                          printed on stderr). The upstream server is still
+                          spawned over stdio.
+                          SECURITY, none of which is optional:
+                            * Binds LOOPBACK. Naming a non-loopback host is
+                              accepted and warned about loudly; it makes the
+                              proxy reachable from your network.
+                            * Origin and Host are validated; a mismatch is 403.
+                              CVE-2025-66414 shipped DNS-rebinding protection
+                              OFF BY DEFAULT in the TypeScript SDK, and the same
+                              default shipped simultaneously in the Python, Go,
+                              Java, Rust and Ruby SDKs. toolwall enables it.
+                            * A bearer token is REQUIRED on every request, and
+                              generated if you do not supply one. There is no
+                              flag to turn it off. CVE-2025-49596 (MCP
+                              Inspector, CVSS 9.4) and CVE-2026-23744 (MCPJam,
+                              CVSS 9.8, exploited in the wild from Feb 2026)
+                              were both unauthenticated local endpoints a web
+                              page could reach.
+                            * Mirrored headers (Mcp-Method, Mcp-Name,
+                              Mcp-Param-*) are checked against the JSON-RPC
+                              body. Disagreement is 400 + -32020 HeaderMismatch.
+                              A proxy that evaluates policy on the header while
+                              execution follows the body enforces nothing.
+                          Under --era 2026-07-28 the endpoint is POST-only with
+                          no sessions and no resumability; GET and DELETE answer
+                          405. Under 2025-11-25 sessions and the standalone GET
+                          SSE stream work as that revision defines them.
+  --listen-path <path>    Endpoint path. Default /mcp.
+  --listen-token <tok>    Bearer token clients must present. Generated when
+                          omitted; printed once on stderr, never written to disk.
+  --listen-allow-origin <origin>  Additionally accept this web Origin (exact
+                          scheme+host+port). Repeatable. Loopback origins are
+                          accepted without being named; everything else is 403.
+
 RESILIENCE
   --no-reconnect        Do not buffer and retry when the upstream server
                           blips; close the client session immediately instead.
@@ -204,6 +260,7 @@ EXAMPLE
   toolwall --allow-command node -- node ./path/to/server.js
   toolwall --policy ./toolwall-policy.json --audit-log ./toolwall-audit.jsonl \\
            --server "node ./path/to/server.js"
+  toolwall --listen 127.0.0.1:8099 --server "node ./path/to/server.js"
 `;
 
 /**
@@ -293,6 +350,12 @@ export function parseArgs(argv: readonly string[]): ParseResult {
     let reconnect = true;
     let reconnectAttempts = 3;
     let replayInFlight: ReplayPolicy = 'read-only-methods';
+    let listen = false;
+    let listenHost = DEFAULT_LISTEN_HOST;
+    let listenPort = 0;
+    let listenPath = '/mcp';
+    let listenToken: string | undefined;
+    const listenAllowedOrigins: string[] = [];
     const allowedCommands: string[] = [];
     const passthroughEnv: string[] = [];
     let trailing: string[] | undefined;
@@ -372,6 +435,60 @@ export function parseArgs(argv: readonly string[]): ParseResult {
                 }
                 serverJsonFile = value;
                 provenance = true;
+                break;
+            }
+            case '--listen': {
+                listen = true;
+                // The value is OPTIONAL, so `needsValue` is not used: `--listen` on its own is the
+                // common case and must not swallow the flag that follows it.
+                const next = argv[i + 1];
+                if (next !== undefined && !next.startsWith('-')) {
+                    i += 1;
+                    const parsedListen = parseListenAddress(next);
+                    if ('error' in parsedListen) {
+                        return { kind: 'error', message: parsedListen.error };
+                    }
+                    listenHost = parsedListen.host;
+                    listenPort = parsedListen.port;
+                }
+                break;
+            }
+            case '--listen-path': {
+                const value = needsValue(arg, argv[++i]);
+                if (value === null || !value.startsWith('/')) {
+                    return { kind: 'error', message: '--listen-path requires an absolute path, e.g. /mcp.' };
+                }
+                listen = true;
+                listenPath = value;
+                break;
+            }
+            case '--listen-token': {
+                const value = needsValue(arg, argv[++i]);
+                if (value === null || value.length < 16) {
+                    return {
+                        kind: 'error',
+                        message: '--listen-token requires a value of at least 16 characters. Omit it and toolwall generates a 256-bit one.'
+                    };
+                }
+                listen = true;
+                listenToken = value;
+                break;
+            }
+            case '--listen-allow-origin': {
+                const value = needsValue(arg, argv[++i]);
+                if (value === null) {
+                    return { kind: 'error', message: '--listen-allow-origin requires an origin, e.g. https://app.example.' };
+                }
+                try {
+                    // Parsed now rather than at bind time: an unparseable origin silently accepted
+                    // here would become an allowlist entry that matches nothing, which reads as
+                    // "configured" and behaves as "not configured".
+                    void new URL(value);
+                } catch {
+                    return { kind: 'error', message: `--listen-allow-origin ${JSON.stringify(value)} is not a URL.` };
+                }
+                listen = true;
+                listenAllowedOrigins.push(value);
                 break;
             }
             case '--no-reconnect':
@@ -542,7 +659,47 @@ export function parseArgs(argv: readonly string[]): ParseResult {
             ...(serverJsonFile !== undefined ? { serverJsonFile } : {}),
             reconnect,
             reconnectAttempts,
-            replayInFlight
+            replayInFlight,
+            ...(listen
+                ? {
+                      listen: {
+                          host: listenHost,
+                          port: listenPort,
+                          path: listenPath,
+                          ...(listenToken !== undefined ? { token: listenToken } : {}),
+                          allowedOrigins: listenAllowedOrigins
+                      }
+                  }
+                : {})
         }
     };
+}
+
+/**
+ * Parse the optional `--listen` value.
+ *
+ * Accepts `port`, `host:port`, `host`, and `[::1]:port`. A bare port is the common case and a bare
+ * host is accepted so `--listen 0.0.0.0` works and gets the warning it deserves rather than an
+ * error a user routes around by picking a worse flag.
+ */
+function parseListenAddress(value: string): { host: string; port: number } | { error: string } {
+    if (/^\d+$/u.test(value)) {
+        const port = Number(value);
+        if (port < 0 || port > 65535) {
+            return { error: `--listen port ${value} is out of range.` };
+        }
+        return { host: DEFAULT_LISTEN_HOST, port };
+    }
+    const { host, port } = splitAuthority(value);
+    if (port === undefined) {
+        return { host: value, port: 0 };
+    }
+    if (!/^\d+$/u.test(port)) {
+        return { error: `--listen ${JSON.stringify(value)} does not end in a port number.` };
+    }
+    const parsedPort = Number(port);
+    if (parsedPort < 0 || parsedPort > 65535) {
+        return { error: `--listen port ${port} is out of range.` };
+    }
+    return { host: host.replace(/^\[|\]$/gu, ''), port: parsedPort };
 }

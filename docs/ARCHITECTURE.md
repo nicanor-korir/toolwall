@@ -728,3 +728,201 @@ path.
 
 Still not measured, and therefore still not claimed: concurrency, a cold pin store on a slow disk,
 and the `tools/list` cold path.
+
+---
+
+## Week-4 transport outcomes (2026-08-19) — correlation and Streamable HTTP (Dev 1)
+
+### C-13 · CLOSED — `GuardContext` carries a correlation id on both legs
+`MessageCorrelation` gained **`correlationId`**, and `ToolwallProxy` populates it on every context
+it builds. Two ids, because there are two questions:
+
+| question | field | reused? |
+|---|---|---|
+| "which REQUEST does this RESULT answer?" | **`correlationId`** | never |
+| "which logical exchange is this, retries included?" | `exchangeId` | yes, by an MRTR retry — that is its purpose |
+
+`exchangeId` alone was never a pairing key: an `input_required` retry deliberately reuses it, so two
+live messages can share one. `correlationId` is minted per request/response round trip from a
+separate counter with a different prefix (`c1`, `c2`… vs `x1`, `x2`…) so the two id spaces cannot be
+confused in a log or a debugger.
+
+**Populated on:** both legs of a client→server request; both legs of a server→client request; every
+relayed notification; every payload lifted out of `inputRequests` (which carries the *enclosing*
+round trip's id — an embedded request has no round trip of its own, and `inputRequestKey`
+distinguishes siblings); and the synthetic post-reconnect re-verification. `#context()` now takes
+correlation as a **required** parameter, so a new leg cannot omit it by accident.
+
+The field is optional in the *type* only, so the one out-of-transport caller that hand-rolls a
+`MessageCorrelation` (`provenanceObserver`) and every unit test that builds a `GuardContext` literal
+keep compiling. Read it with `correlationIdOf(ctx)`, or narrow with `isCorrelated(ctx)` to
+`CorrelatedGuardContext`.
+
+**Proven, not asserted:** `test/integration/correlation.test.ts` runs a real proxy against
+`test/fixtures/concurrent-server.mjs`, which answers **out of order**. Five `tools/call`s with
+descending delays are all in flight at once and come back reversed; every result is matched to the
+call whose tag it carries.
+
+### C-13a · REQUEST TO DEV 3 — `ResultGuard` can stop skipping, and one more thing
+The transport side is done. Two changes in `src/guards/runtime/result-guard.ts` follow from it:
+
+1. **Replace `#correlate()`'s queue with a map keyed on `ctx.correlation.correlationId`.** Record on
+   the request leg, look up and delete on the response leg. No ordering assumption, no ambiguity,
+   and `toolwall/result.uncorrelated` stops firing under concurrency — measured today as **4 of 5**
+   concurrent results uncorrelated, i.e. four results whose `outputSchema` was silently not enforced.
+   C-19's `ctx.method === "tools/call"` guard becomes unnecessary (a `resources/read` result cannot
+   pop a `tools/call` entry when the key is the round trip), though keeping it costs nothing. Bound
+   the map and evict oldest-first: a request whose upstream call throws never reaches the response
+   leg, so entries can accumulate.
+2. **Key `#lastError` by TOOL, not one slot per server.** This is not a correlation fix; it is what
+   correlation makes *sound*. Today an interposed unrelated call consumes the record before the ATPA
+   retry is inspected, and an error result arriving with another call in flight is recorded against
+   `toolName: ""` and matches nothing afterwards. Correlation fixes the second; keying by tool fixes
+   the first. `test/integration/correlation.test.ts` contains a reference implementation
+   (`CorrelatingProbe`) that catches `flaky:debug_context` through an ATPA sequence with a `plain`
+   call and a `tools/list` interleaved between the error and the retry, alongside `QueueProbe` — the
+   current algorithm reproduced exactly — which catches nothing on the same traffic.
+
+### C-25 · Streamable HTTP — what is live, what is not
+**Live: the client-facing leg.** `src/transport/listener.ts` (`StreamableHttpListener`) implements
+`Transport`, so it drops into `assembleToolwall({ clientTransport })` where `StdioServerTransport`
+went. The CLI constructs it under `--listen`. **stdio remains the default and is unchanged.**
+
+Security, none of it optional and all of it tested in `test/integration/http.test.ts`:
+
+| control | behaviour | why |
+|---|---|---|
+| Origin + Host validation | **403** | CVE-2025-66414 shipped DNS-rebinding protection OFF by default in the TS SDK *and simultaneously in the Python, Go, Java, Rust and Ruby SDKs*. Verified in the vendored tree: `webStandardStreamableHttp.js:79` reads `?? false` |
+| loopback bind | `127.0.0.1` default, loud warning otherwise | CVE-2025-49596 (Inspector, 9.4), CVE-2026-23744 (MCPJam, 9.8, exploited from Feb 2026) |
+| bearer token | **401**, generated when not supplied, **no flag disables it** | we must not become the unauthenticated local control plane the spec warns stdio proxies about |
+| header/body agreement | **400 + `-32020`**, sentinel decoded first | Akamai header confusion: policy on the header, execution on the body |
+
+Check order is a security decision: path → Origin/Host → auth → era shape → body → header agreement.
+Origin **before** credentials, so a hostile page cannot use the refusal as an auth oracle.
+
+**`src/transport/headers.ts` is no longer `exported-only`.** It was classified that way in
+`test/integration/wiring-completeness.test.ts` precisely so "complete control, no live consumer"
+had a test behind it; wiring it made that classification false and the inverse check failed until it
+was corrected to `support`. **No module claims `exported-only` today.**
+
+**Not live: the upstream leg from the CLI.** `createUpstreamHttpTransport()` is complete and proven
+end to end against a real HTTP MCP server (`test/integration/http.test.ts` drives a real
+`ToolwallProxy` over it, with a guard blocking on the request leg), but `assembleToolwall()` takes a
+`SpawnSpec` and builds a stdio child unconditionally, and `src/index.ts` is the integrator's.
+**Request to the integrator:** one additive option —
+`ToolwallOptions.upstream?: { kind: "http"; url: string } | { kind: "stdio"; spec: SpawnSpec }` —
+with `createUpstreamHttpTransport` supplying the transport and the `serverId` exactly as
+`createUpstreamStdioTransport` does. Until it lands, `toolwall --server` cannot point at a remote
+URL and the README says so.
+
+### C-26 · The two HTTP eras are two implementations, and one of them is ours
+`2025-11-25` delegates to the SDK's `StreamableHTTPServerTransport`: sessions, the standalone `GET`
+SSE stream, `DELETE`, resumability.
+
+`2026-07-28` does **not**, and the reason is a hard SDK property read out of the vendored tree:
+`webStandardStreamableHttp.js:174` throws *"Stateless transport cannot be reused across requests"*
+the second time a transport with no `sessionIdGenerator` handles anything. The SDK's stateless mode
+is one transport per HTTP request, which cannot be the client leg of a long-lived proxy session. The
+POST-only shape is small enough to own: one message per POST, `202` for a notification, `405` on
+GET/DELETE, no sessions, no resumability.
+
+**Stated limitation of that lane, not discovered later:** a server→client message that is not the
+answer to an in-flight POST — a relayed `notifications/message`, `notifications/progress`, a sampling
+request — has no channel on a POST-only endpoint. It is reported on the operator channel and
+dropped. Under `2025-11-25` those ride the `GET` stream and are delivered normally, and `2025-11-25`
+is what every shipping client speaks. Carrying them under `2026-07-28` needs the POST response to
+become an SSE stream keyed on `relatedRequestId`; that is the next piece of work and is not
+pretended to exist.
+
+### C-27 · `wiring-completeness` now walks two entry points, for transports only
+`src/index.ts` is the library entry; `src/cli/index.ts` is the `bin`. The Streamable HTTP listener is
+constructed only by the binary, so a walk rooted at the library entry alone would call it dead.
+Transport modules are therefore checked against **both** roots, in a test that says so in its name.
+`guards/`, `policy/` and `audit/` are deliberately still checked against `src/index.ts` alone — that
+is where `assembleToolwall` lives and where all three dead-code recurrences happened, and widening
+their root set would weaken exactly the assertion C-22 exists to make.
+
+### C-28 · The flat 5 ms budget is retired and replaced with a measured curve
+`C-11 (re-measured, Week 3)` reported the `wide` workload OVER a 5 ms p99 budget and attributed most of
+the cost to "the extra process hop and the JSON re-serialization". Half of that attribution was wrong,
+and the benchmark now proves it with a fourth configuration.
+
+**`pipe`** is a raw byte relay: two `PassThrough`s splicing the child's stdio to the client, parsing
+nothing and guarding nothing. Same topology, same process, same stream primitives as the zero-guard
+proxy, with the JSON-RPC codec deleted. It is the physical floor for interposition, and it decomposes
+added latency into three layers with three different owners:
+
+| workload | KiB | nodes | relay | codec | guards | total added mean |
+|---|---|---|---|---|---|---|
+| small | 0.0 | 5 | −0.37 | +0.14 | +0.12 | ≈0 |
+| large | 64.0 | 5 | +0.03 | +0.68 | +1.06 | +1.76 ms |
+| narrow | 52.2 | 3 007 | +0.01 | +0.57 | +0.26 | +0.84 ms |
+| wide | 212.6 | 12 007 | −0.32 | +3.48 | +2.70 | **+5.85 ms** |
+| huge | 860.1 | 48 007 | +0.45 | +9.24 | +7.10 | **+16.80 ms** |
+
+**The process hop is not the cost. `relay` is ±0.45 ms across a 9-byte-to-860-KiB range, with no
+trend — interposition is free.** The cost is the codec: one extra parse and one extra re-serialize per
+leg. On `huge` that alone is **+9.24 ms with every guard removed**, so a proxy that parses MCP traffic
+and forwards it unchanged misses a 5 ms budget by 94% while guarding nothing. There is no proxy design
+in any language that both reads a payload and avoids this. **A flat sub-5 ms budget was below the floor,
+not merely unmet**, and it survived three weeks only because no workload had enough nodes to expose it.
+
+The replacement is a function of payload shape, with constants fixed in source and not refitted per run:
+
+```
+added mean ≤ 0.70 ms + 0.03 ms/KiB + 0.16 ms per 1 000 nodes
+```
+
+Two further decisions, both of which are about making the budget *believed*:
+
+- **The mean gates; p99 is printed, not enforced.** p99 over 1000 samples is ten samples across four
+  process configurations and a GC. The `direct` baseline — nothing of ours in the path — recorded a
+  42.7 ms max on `wide` and the raw relay 94.7 ms on `huge`. Run-to-run p99 moved by more than the
+  entire guard cost being measured. Gating on it would manufacture exactly the unreproducible red that
+  teaches a team to stop reading CI.
+- **The benchmark detects its own contamination.** Run at load average 42 it reported `relay` at
+  −5.03 ms: a byte splice apparently faster than no splice, which is impossible and means the baseline
+  was squeezed while the guarded runs were not. Every derived number in such a run is meaningless and
+  *plausible*, which is the dangerous combination. `npm run bench` now exits non-zero with
+  `RUN CONTAMINATED` when `relay < −0.75 ms` rather than printing a summary table someone might quote.
+
+CI runs the benchmark and never gates on it (`.github/workflows/ci.yml`), for the same reason.
+
+### C-29 · REQUEST TO DEV 3 — two measured findings in `capability-guard.ts`
+Both are in `src/guards/runtime/`, so they are reported rather than patched.
+
+**1. The node cap fails OPEN, and the header says so.** `walk()` stops at `nodeCap` (200 000) with
+`break`, returning a partial `ScannedShape`. Two consequences, both silent: `protoKey` is `false`
+rather than "unknown", so a `__proto__` key beyond the cap is not reported; and `totalBytes` is
+under-measured, so `resultBoundsFindings` cannot fire `maxTotalBytes` on the very payloads most likely
+to breach it. A result large enough to defeat inspection is currently trusted *more* than a small one.
+The fix is to surface truncation on the returned shape and let `ResultGuard` treat it as a finding —
+fail safe, not fail open. This is the one place where "bounded so measurement cannot be weaponised"
+(T-08) and "fail closed" currently disagree.
+
+**2. `Buffer.byteLength` is ~34% of the walk, and is avoidable.** Measured on the `wide` payload
+(12 007 nodes, 217 749 bytes), 3 000 iterations after 300 warmup, same host as the table above:
+
+| variant | p50 | p99 | mean | vs current |
+|---|---|---|---|---|
+| current (`Buffer.byteLength` per string and per key) | 0.8236 | 1.1334 | 0.8590 | — |
+| memoise key lengths in a `Map` | 0.5896 | 1.0844 | 0.6217 | −27.6% |
+| **manual UTF-8 length, ASCII fast path** | **0.5319** | **0.7643** | **0.5657** | **−34.1%** |
+| memo + manual | 0.5469 | 0.7786 | 0.5835 | −32.1% |
+| memo + manual + level-order traversal | 0.5074 | 0.7919 | 0.5406 | −37.1% |
+
+All four variants were checked to return byte-identical `ScannedShape` output to the current
+implementation on the test payload before being timed. The winner on simplicity-per-gain is the third:
+replace `Buffer.byteLength(s, "utf8")` with a hand-rolled length that adds 1 for `< 0x800`, 2 otherwise,
+and 2 with an index skip for a high surrogate. The key memo is redundant once that lands (keys are short
+and ASCII), and the level-order rewrite buys 3% more for a structural change — not worth it.
+
+**Expected end-to-end effect, stated so it is not oversold:** the walk is ~1.0 ms of the +2.70 ms guard
+column on `wide`, so −34% of it is ≈0.35 ms off a 5.85 ms total. Real, free, and small. It does not
+change the C-28 conclusion, because the codec — which is not ours — is the term that dominates.
+
+**Measured and rejected:** skipping the response-leg re-serialization when no guard mutated the payload.
+`JSON.stringify` of the 219 KiB `wide` result is 0.33 ms p50 / 0.65 ms p99 against a codec cost of
+3.48 ms mean, so forwarding the original bytes would recover under 10% of the layer it targets while
+requiring the transport to retain every raw frame. Not worth the coupling. Recorded here so it is not
+re-proposed as an obvious win.

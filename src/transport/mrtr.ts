@@ -237,6 +237,7 @@ export class ExchangeCorrelator {
     readonly #byStateHash = new Map<string, string>();
     readonly #limit: number;
     #counter = 0;
+    #correlationCounter = 0;
 
     constructor(limit = 512) {
         this.#limit = Math.max(1, limit);
@@ -246,6 +247,21 @@ export class ExchangeCorrelator {
     mint(): string {
         this.#counter += 1;
         return `x${this.#counter.toString(36)}`;
+    }
+
+    /**
+     * A fresh **correlation id** — the C-13 pairing key for one request/response
+     * round trip.
+     *
+     * A separate counter from `mint()` on purpose, and the prefix differs, so
+     * the two id spaces can never be confused for one another in a log, an audit
+     * record or a debugger. An exchange id may be reused by an MRTR retry; a
+     * correlation id never is, which is exactly why a result can be matched to
+     * its own request with it and cannot with the other.
+     */
+    mintCorrelationId(): string {
+        this.#correlationCounter += 1;
+        return `c${this.#correlationCounter.toString(36)}`;
     }
 
     get size(): number {
@@ -311,15 +327,24 @@ export function eraUsesMrtr(era: ProtocolEra): boolean {
     return era === '2026-07-28';
 }
 
-/** Build the correlation record for an embedded input request. */
+/**
+ * Build the correlation record for an embedded input request.
+ *
+ * `correlationId` is the **enclosing** round trip's, not a new one: the embedded
+ * request is a payload inside a result, it has no request leg and no response
+ * leg of its own, so minting an id for it would create a key nothing can ever
+ * pair with. Siblings are distinguished by `inputRequestKey`.
+ */
 export function correlationForEmbedded(options: {
+    readonly correlationId: string;
     readonly exchangeId: string;
     readonly outerMethod: string;
     readonly requestId?: string | number;
     readonly inputRequestKey: string;
     readonly requestStateHash?: string;
-}): MessageCorrelation {
+}): MessageCorrelation & { readonly correlationId: string } {
     return {
+        correlationId: options.correlationId,
         exchangeId: options.exchangeId,
         ...(options.requestId !== undefined ? { requestId: options.requestId } : {}),
         outerMethod: options.outerMethod,

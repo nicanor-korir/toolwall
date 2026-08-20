@@ -27,9 +27,12 @@
  * | `exported-only` | **it has no consumer in the shipped path** | on the public export surface, and the reason it has no consumer is written down |
  *
  * `exported-only` exists so that "built but nothing calls it" has to be an explicit, argued claim
- * rather than something a reader has to discover with `grep`. `src/transport/headers.ts` is the
- * one module in that state today: it validates the MCP 2026-07-28 header/body agreement rules, and
- * there is no HTTP listener yet for it to validate anything on.
+ * rather than something a reader has to discover with `grep`. `src/transport/headers.ts` used to be
+ * the one module in that state — it validates the MCP 2026-07-28 header/body agreement rules and
+ * there was no HTTP listener for it to validate anything on. `src/transport/listener.ts` is now
+ * that listener, so the classification became false and the inverse check below failed until it
+ * was corrected to `support`. **No module claims `exported-only` today**, which is the state this
+ * file was written to push the codebase towards.
  *
  * A new file under those directories fails this suite until somebody classifies it. A module that
  * is neither wired nor declared opt-in fails it. A module that claims `assembled` but is not
@@ -146,6 +149,15 @@ const MANIFEST: Record<string, Classification> = {
         status: 'assembled',
         reason: '`UnicodeHygieneGuard` — registered on the ten response methods that carry server-authored text.'
     },
+    'guards/metadata/assess.ts': {
+        status: 'support',
+        reason:
+            'the pin-time risk assessment. Called from drift.ts on the listing path — once, and only when a pin ' +
+            'decision is actually pending — so it reaches an operator through the `pinned` event under TOFU and ' +
+            'through the pin-unpinned confirmation finding under strict. It is `support` rather than `assembled` ' +
+            'because it is not a Guard and registers nothing: it produces evidence a human reads and changes no ' +
+            'verdict, which is the whole design (it computes no aggregate for anything to block on).'
+    },
     'guards/metadata/canonicalize.ts': {
         status: 'support',
         reason: 'the hash the pin store keys on. Called from drift.ts.'
@@ -211,8 +223,19 @@ const MANIFEST: Record<string, Classification> = {
         reason: 'reads MRTR inputRequests and result types out of a payload. Called from proxy.ts (#liftInputRequests) and result-guard.ts.'
     },
     'transport/headers.ts': {
-        status: 'exported-only',
-        reason: 'HTTP header/body agreement for the 2026-07-28 revision. toolwall ships a stdio transport only, so there is no HTTP listener for this to validate on and it has NO live consumer. It is exported, unit-tested and honest about being unused; the README says so under "What toolwall does NOT do".'
+        status: 'support',
+        reason:
+            'HTTP header/body agreement for the 2026-07-28 revision. It WAS `exported-only` — a complete control with no live consumer, because toolwall shipped a stdio transport only. `transport/listener.ts` now calls verifyHeaderBodyAgreement on every POST before the body reaches a guard, so the old classification became false and this check is what said so.'
+    },
+    'transport/http.ts': {
+        status: 'support',
+        reason:
+            'the Streamable HTTP era profile (2026-07-28 POST-only vs the 2025-11-25 session/GET shape), the Origin/Host and bearer checks the listener enforces, and the upstream client leg. Reached from the CLI entry point through listener.ts. NOTE the honest split: the listener half is live under --listen; createUpstreamHttpTransport is complete and proven in test/integration/http.test.ts against a real HTTP server, but is NOT reachable from assembleToolwall(), which takes a SpawnSpec and builds a stdio child unconditionally. The additive ToolwallOptions change that would wire it is written down in the module header.'
+    },
+    'transport/listener.ts': {
+        status: 'support',
+        reason:
+            'the Streamable HTTP front door, constructed by the CLI under --listen and passed to assembleToolwall as the clientTransport. It binds loopback, validates Origin/Host (403), requires a bearer token with no way to disable it, enforces the era HTTP shape (405 on GET/DELETE under 2026-07-28) and runs the header/body agreement check (400 + -32020) before any guard sees a body.'
     },
 
     'guards/runtime/index.ts': {
@@ -252,9 +275,9 @@ function resolveSpecifier(fromFile: string, specifier: string): string {
  * This is the check that would have caught both Week-3 modules on the day they landed: neither
  * appeared anywhere in this set, so no test, no type error and no lint rule had anything to say.
  */
-function reachableFromEntry(): Set<string> {
+function reachableFromEntry(roots: readonly string[] = [ENTRY]): Set<string> {
     const seen = new Set<string>();
-    const stack = [ENTRY];
+    const stack = [...roots];
     while (stack.length > 0) {
         const file = stack.pop() as string;
         if (seen.has(file)) continue;
@@ -273,6 +296,22 @@ function reachableFromEntry(): Set<string> {
 }
 
 const reachable = reachableFromEntry();
+/**
+ * Everything the SHIPPED PRODUCT can reach, which is two entry points and not one.
+ *
+ * `src/index.ts` is the library entry; `src/cli/index.ts` is the `bin`, and it is the one an
+ * operator actually runs. A transport that only the binary constructs — the Streamable HTTP
+ * listener is the first — is reachable in every sense a user cares about while being invisible to
+ * a walk that starts at the library entry alone.
+ *
+ * This is deliberately NOT used to relax the check for `guards/`, `policy/` and `audit/`. Those
+ * are the directories where the C-17 and C-22 recurrences happened, the library entry is where
+ * `assembleToolwall` lives, and widening their root set would weaken exactly the assertion this
+ * file exists to make. Transport modules are the only ones judged against both roots, and the
+ * test below says so in its own name.
+ */
+const CLI_ENTRY = path.join(SRC, 'cli', 'index.ts');
+const reachableFromShippedEntries = reachableFromEntry([ENTRY, CLI_ENTRY]);
 const entrySource = readFileSync(ENTRY, 'utf8');
 
 /**
@@ -335,17 +374,35 @@ describe('C-22 · every capability module is either wired or declared opt-in', (
         expect(missing, 'these manifest entries name files that no longer exist').toEqual([]);
     });
 
-    it('every non-barrel module is import-reachable from src/index.ts', () => {
+    it('every non-barrel guard, policy and audit module is import-reachable from src/index.ts', () => {
         // THE check. `src/policy/infer.ts` and `src/audit/provenance.ts` both failed exactly this
-        // for the whole of Week 3 while their unit tests were green.
+        // for the whole of Week 3 while their unit tests were green. The library entry is the only
+        // root here on purpose — `assembleToolwall` lives there, and these are the directories
+        // where all three recurrences happened.
         const unreachable = Object.entries(MANIFEST)
-            .filter(([, c]) => c.status !== 'barrel')
+            .filter(([m, c]) => c.status !== 'barrel' && !m.startsWith('transport/'))
             .map(([m]) => m)
             .filter(m => !reachable.has(path.join(SRC, m)));
         expect(
             unreachable,
             'Nothing in src/index.ts imports these, transitively, so no code path in the shipped ' +
                 'product can reach them. They are dead however good their unit tests are.'
+        ).toEqual([]);
+    });
+
+    it('every non-barrel transport module is reachable from src/index.ts OR from the CLI binary', () => {
+        // Transports are the one family with two legitimate entry points: an embedder builds one
+        // through the library, and the `bin` builds one the library never mentions. The Streamable
+        // HTTP listener is only ever constructed by the CLI, and calling that dead would be false.
+        // A transport reachable from NEITHER is still dead, and still fails here.
+        const unreachable = Object.entries(MANIFEST)
+            .filter(([m, c]) => c.status !== 'barrel' && m.startsWith('transport/'))
+            .map(([m]) => m)
+            .filter(m => !reachableFromShippedEntries.has(path.join(SRC, m)));
+        expect(
+            unreachable,
+            'Neither src/index.ts nor src/cli/index.ts imports these, transitively. Nothing the ' +
+                'product ships can construct them.'
         ).toEqual([]);
     });
 

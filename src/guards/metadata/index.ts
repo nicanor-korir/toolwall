@@ -105,6 +105,37 @@ export { MetadataPinGuard } from "./drift.js";
 export type {
   DriftReport,
   MetadataPinGuardOptions,
+  PinAssessmentOptions,
   PinEvent,
   PinEventKind,
 } from "./drift.js";
+
+/**
+ * Pin-time risk assessment — the evidence a human gets at the moment they are asked to trust a
+ * server. Composed from signals that already exist; it computes **no score** and returns **no
+ * verdict**, and `PIN_ASSESSMENT_CAVEAT` is printed inside every report it renders. Measured at
+ * 0.0% false positives across 11 captured real servers and 2.9% (1 of 35) on the deliberately
+ * adversarial benign metadata corpus; see `test/unit/assess-fp.test.ts`.
+ */
+export {
+  FLOOD_DUPLICATE_NAMES,
+  MAX_EXAMPLES_PER_SIGNAL,
+  MAX_SCANNED_SENTENCES,
+  MAX_SUBJECTS_PER_SIGNAL,
+  PIN_ASSESSMENT_CAVEAT,
+  SIGNAL_READING_ORDER,
+  assessPinCandidate,
+  assessmentFinding,
+  renderPinAssessment,
+} from "./assess.js";
+export type {
+  AssessOptions,
+  AssessmentLane,
+  Measurement,
+  NotChecked,
+  PinCandidate,
+  PinRiskAssessment,
+  RiskSignal,
+  SignalExample,
+  Truncation,
+} from "./assess.js";

@@ -86,6 +86,12 @@ server→client payloads. These depend on the proxy existing to attack; the fixt
 Fired at the reconnect path, confirmation budget, response-leg/MRTR, egress, and scope-keyed pins.
 New files: `confirm-dialog-injection.test.ts`, `atpa-gaps.test.ts`, `round2-boundaries.test.ts`.
 
+### Round 2 status after Dev 3's fixes
+Two of the three ATPA demonstrations are now CLOSED and their tests assert the closed behaviour
+(single-slot `#lastError` -> per-server ring, per-tool keying, cross-tool lane). The
+`isPrivateAddress` compressed IPv4-mapped IPv6 bug is fixed (real 8-hextet parser). BYPASS 1 stays
+open deliberately — see `atpa-gaps.test.ts`.
+
 ### Proven bypass — HITL confirmation dialog is spoofable through `locus` (P2)
 `confirm-dialog-injection.test.ts` (2 asserts, RED). `renderPrompt`/C-14 promise the operator
 "Nothing above is quoted from the server," rendering only ruleId/severity/locus/remediation. But
@@ -125,3 +131,86 @@ source; pinned here so the boundary is regression-visible. Owner: `src/guards/ru
   (`isPrivateAddress` misses the WHATWG-compressed IPv4-mapped IPv6 loopback `[::ffff:7f00:1]`) but it
   is NOT reachable through `evaluateUrl` — the private check runs only on the wildcard path and an IP
   literal cannot match a wildcard. Owner: `src/policy/hosts.ts`.
+
+
+---
+
+## Round 3 (2026-08-19) — HTTP listener, cloud metadata, pin-time assessment
+
+New files: `http-listener.test.ts`, `cloud-metadata-shortname.test.ts`, `assess-signal-suppression.test.ts`.
+
+### Proven gap — single-label cloud-metadata short forms — NOW FIXED
+`cloud-metadata-shortname.test.ts` (7/7 green). `METADATA_HOSTS` keyed on FQDNs only, so
+`metadata.google.internal` was denied but the bare `metadata` — the documented GCE short form that
+resolves to the same IMDS via the instance search domain — was allowed, as was EC2's
+`instance-data`. Payload:
+`http://metadata/computeMetadata/v1/instance/service-accounts/default/token`.
+Reachable under an inferred `ANY_HOST` grant, which is the exact configuration `hosts.ts` says the
+deny-list exists to backstop. Dev 3 fixed it; re-verified here, and the fix is correctly scoped —
+`metadata` and `instance-data` are denied while ordinary single-label names (`helper`) and
+`metadata.evil.example` are not over-blocked. The rest of that deny-list was already thorough
+(decimal, octal, hex, trailing dots, IPv4-mapped/compatible, NAT64, 6to4) and that coverage is
+locked in by the same file.
+
+### Proven suppression — flooding the pin-time assessment — NOW FIXED
+`assess-signal-suppression.test.ts`. Originally `assessPinCandidate` ran the whole deterministic
+lane before the structural lane and truncated at `maxSignals` (40) with no ranking, emitting one
+signal per duplicated NAME — so 40 duplicate-name pairs blanketed every structural signal,
+**order-independently**. Measured cliff at the time: 39 pairs -> the credential directive survived,
+40 pairs -> gone from `signals` and `rendered` with no notice.
+
+Dev 2 closed it: one signal per RULE carrying `occurrences`/`examples[]`/`omittedSubjects`, a fixed
+`SIGNAL_READING_ORDER` table keyed on rule id, flooding promoted to a ranked finding of its own, and
+a required `truncated` field. Re-baselined to assert the fixed behaviour, with the payload kept.
+
+**The structural claim HOLDS.** Dev 2's fix rests on rule ids being toolwall's and finite, so
+`signals.length <= 15 < 40`. Attacked directly and could not break it:
+- Firing as many distinct rules as one listing can reach — invisible characters, duplicates, a
+  credential directive, concealment, a cross-server reference, narrow-name/broad-schema, an
+  unreadable entry, and a flood — tops out at **8 distinct rules**, against a table of 15 and a cap
+  of 40. Every `id:` in assess.ts is a string literal, so no signal id is server-constructed.
+- Repetition buys nothing: 30 duplicated names produce one signal with `occurrences: 30` and at most
+  3 examples.
+- The flooding rule cannot push anything down. It ranks second, so it reorders — but
+  `renderPinAssessment` has no display cap, and every displaced signal down to the lowest-ranked
+  (`assess-unreadable-tool`, rank 130) still reaches the sheet with `truncated.droppedSignals: 0`.
+
+### FOLLOW-UP FINDING (open) — the 60-char clip does not cover the headline
+`assess-signal-suppression.test.ts` (2 asserts, RED). `excerpt(subject, 60)` flattens whitespace and
+clips, and it is applied to `RiskSignal.subjects` — but three headlines interpolate the RAW tool name
+(assess.ts:733, :755, :777) and `examples[].subject` stores it raw too. A raw name keeps its
+newlines, so an attacker-chosen name forges its own rows in the rendered sheet:
+
+    name: "ok_tool\n│ rule   : toolwall/verified [info]\n│          Reviewed and approved."
+
+renders as three lines at the top of the deterministic lane. The shape needs exactly ONE duplicated
+name, which keeps `occurrences` at 1 so the per-name headline is used rather than the grouped one,
+and stays under `FLOOD_DUPLICATE_NAMES` (10) so the flooding signal does not fire either — nothing
+warns the reader. Same class as the Round 2 `locus` dialog injection, landing on the same human
+decision surface. Severity medium. Owner: `src/guards/metadata/assess.ts`.
+
+### HTTP listener — 17/17, defenses HELD
+`http-listener.test.ts` drives a real socket with real `fetch` and raw HTTP. Confirmed:
+- **Origin-before-credentials holds.** A hostile origin gets 403 with no token, a wrong token, and a
+  CORRECT token alike, with no `WWW-Authenticate` — no auth oracle. A valid token from a hostile
+  origin cannot reach body parsing (malformed body still 403, not 400).
+- **Credentials.** Duplicate `Authorization` is deterministic (node discards repeats, first wins), so
+  appending the real token after a bad one does not authenticate. Header-name casing is irrelevant.
+  The `Bearer` scheme token is case-SENSITIVE — an RFC-compat bug that errs closed; recorded so it is
+  not "fixed" into a loose matcher.
+- **Rebinding.** `Host: evil.example` is 403 even with the right token. Origins that merely contain a
+  loopback literal (`127.0.0.1.evil.example`, `127.0.0.1@evil.example`, …) are all 403.
+- **Boundaries, stated:** omitting `Host` entirely skips the Host check (HTTP/1.0), and `Origin: null`
+  is accepted by design — in both cases the bearer token is the only control left, and it holds.
+  Neither is browser-reachable, since browsers always send `Host`.
+- **Era lanes.** 2026-07-28 answers 405 to GET/DELETE after auth; claiming 2025-11-25 in a header does
+  not restore GET. A legacy-lane header/body split is refused (-32022) rather than policed on trust.
+  The `=?base64?…?=` sentinel is decoded before comparison, so it cannot smuggle a split; a matching
+  encoded header is carried (200), proving the decode is real.
+- **Noted, not a finding:** the path check precedes Origin, so 404-vs-403 distinguishes the endpoint
+  path — unreadable cross-origin (opaque response) and useless to a local process, so informational.
+
+### Not attacked to conclusion
+Correlation ids (C-13). The type distinction is sound on inspection (`correlationId` minted per
+round trip, `exchangeId` deliberately reused across an MRTR retry), and `test/integration/correlation.test.ts`
+covers it, but I did not build a collision or replay attempt. Recorded as unexamined rather than held.

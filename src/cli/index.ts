@@ -32,6 +32,7 @@ import {
 } from '../audit/provenance.js';
 import { defaultPolicy, parsePolicy, type ResolvedPolicy } from '../policy/parse.js';
 import { SpawnPolicyError, describeInheritedEnvironment, type SpawnSpec } from '../transport/spawn.js';
+import { StreamableHttpListener, type ListenerEvent } from '../transport/listener.js';
 import { totalBackoffMs } from '../transport/reconnect.js';
 import type { ProxyEvent } from '../transport/proxy.js';
 
@@ -193,10 +194,37 @@ export async function main(argv: readonly string[]): Promise<number> {
         );
     }
 
+    /*
+     * The client-facing leg.
+     *
+     * stdio unless `--listen` was named, and stdio stays the default: the overwhelming majority of
+     * clients spawn their MCP servers as child processes, and opening a port nobody asked for is
+     * exactly the posture CVE-2025-49596 and CVE-2026-23744 punished. When a listener IS asked
+     * for, everything that makes it safe to open — loopback bind, Origin/Host validation, a
+     * mandatory bearer token, header/body agreement — is inside `StreamableHttpListener` rather
+     * than here, so an embedder that constructs one directly gets the same posture the CLI does.
+     */
+    const listenerEvents: ListenerEvent[] = [];
+    const listener =
+        opts.listen === undefined
+            ? undefined
+            : new StreamableHttpListener({
+                  era: opts.era,
+                  host: opts.listen.host,
+                  port: opts.listen.port,
+                  path: opts.listen.path,
+                  ...(opts.listen.token !== undefined ? { token: opts.listen.token } : {}),
+                  allowedOrigins: opts.listen.allowedOrigins,
+                  onEvent: event => {
+                      listenerEvents.push(event);
+                      reportListenerEvent(event, opts.verbose);
+                  }
+              });
+
     let toolwall: Toolwall;
     try {
         toolwall = assembleToolwall({
-            clientTransport: new StdioServerTransport(),
+            clientTransport: listener ?? new StdioServerTransport(),
             spec,
             spawnPolicy: {
                 ...(opts.allowedCommands !== undefined ? { allowedCommands: opts.allowedCommands } : {}),
@@ -309,6 +337,29 @@ export async function main(argv: readonly string[]): Promise<number> {
         return 1;
     }
 
+    if (listener !== undefined) {
+        // Printed AFTER start(), because the port is only known once the socket is bound — the
+        // default asks the OS for one. The token is printed exactly here and nowhere else: it is
+        // never written to the audit log, the pin store or any file.
+        err(
+            `toolwall: listening on ${listener.url} era=${listener.era} ` +
+                `(${listener.profile.allowedMethods.join('/')}${listener.profile.usesSessions ? ', sessions' : ', no sessions'}` +
+                `${listener.profile.supportsResumability ? ', resumable' : ', no resumability'})`
+        );
+        err(`toolwall: bearer token for this session: ${listener.token}`);
+        err(
+            'toolwall: every request needs `Authorization: Bearer <token>`, and Origin/Host are validated ' +
+                '(403 on mismatch). There is no way to turn either off — see --help under HTTP.'
+        );
+        if (listener.boundBeyondLoopback) {
+            err(
+                `toolwall: WARNING this listener is bound to ${opts.listen?.host ?? '?'}, which is NOT loopback. ` +
+                    'Anything that can route to this machine can now reach the MCP server toolwall is proxying, ' +
+                    'protected only by the bearer token. Bind 127.0.0.1 unless you have a reason not to.'
+            );
+        }
+    }
+
     if (opts.verbose) {
         err(`toolwall: proxying (era=${toolwall.era}, pid=${toolwall.upstreamTransport.pid ?? 'unknown'})`);
     }
@@ -329,11 +380,17 @@ export async function main(argv: readonly string[]): Promise<number> {
             }
         }, 100);
         poll.unref();
-        process.stdin.once('end', () => {
-            clientGone = true;
-            clearInterval(poll);
-            resolve();
-        });
+        if (listener === undefined) {
+            // stdio only. Under --listen our stdin is not the protocol channel — it is whatever the
+            // operator's shell hands us — so its EOF says nothing at all about whether a client
+            // went away, and treating it as "the client left" would tear the listener down the
+            // moment toolwall was started from a script.
+            process.stdin.once('end', () => {
+                clientGone = true;
+                clearInterval(poll);
+                resolve();
+            });
+        }
     });
 
     if (clientGone) {
@@ -367,6 +424,29 @@ async function persist(toolwall: Toolwall): Promise<void> {
         await toolwall.audit.flush();
     } catch (error) {
         err(`toolwall: could not write the audit log: ${error instanceof Error ? error.message : String(error)}`);
+    }
+}
+
+function reportListenerEvent(event: ListenerEvent, verbose: boolean): void {
+    switch (event.kind) {
+        case 'listening':
+            // The CLI prints its own, richer line after start(); this would duplicate it.
+            break;
+        case 'rejected':
+            // Unconditional for 401/403: a refused request on a security tool's own control plane
+            // is the operator's business whether or not they asked for verbosity. The rejected
+            // BODY is never printed — it is attacker-shaped input.
+            if (event.status === 401 || event.status === 403 || verbose) {
+                err(`toolwall: HTTP ${event.status} ${event.method} ${event.path} [${event.ruleId}] ${event.message}`);
+            }
+            break;
+        case 'listener-error':
+            err(`toolwall: listener error: ${event.error.message}`);
+            break;
+        default: {
+            const exhaustive: never = event;
+            void exhaustive;
+        }
     }
 }
 

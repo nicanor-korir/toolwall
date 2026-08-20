@@ -72,12 +72,65 @@ export type GuardDirection = 'request' | 'response';
  * a **different JSON-RPC id**, so id alone cannot tie the two halves of the
  * exchange together. `exchangeId` does: it is stable across the whole round
  * trip, including the retry.
+ *
+ * ## `correlationId` vs `exchangeId` — contract C-13
+ *
+ * Two ids, because there are two different questions and answering both with
+ * one value gets one of them wrong:
+ *
+ * | question | field |
+ * |---|---|
+ * | "which REQUEST does this RESULT answer?" | `correlationId` |
+ * | "which logical exchange is this message part of, retries included?" | `exchangeId` |
+ *
+ * `exchangeId` is deliberately **reused** by an MRTR retry — that is its whole
+ * purpose. So it is not a pairing key: two messages can share one. A guard that
+ * matched a result to a request on `exchangeId` alone would be right almost
+ * always and wrong exactly when a client retries an `input_required` exchange.
+ * `correlationId` is minted fresh for every request/response round trip and is
+ * never reused, so it is the key to match on.
  */
 export interface MessageCorrelation {
+    /**
+     * **The correlation id (C-13).** Identifies exactly one request/response
+     * round trip, and is byte-identical on that round trip's request leg and its
+     * response leg.
+     *
+     * This is what a guard keys on to pair a result with the call that produced
+     * it. Before it existed, `ResultGuard` matched a `tools/call` result against
+     * "the single call in flight" and, with more than one outstanding, declined
+     * to guess — emitting `toolwall/result.uncorrelated` and skipping
+     * `outputSchema` and ATPA entirely. Declining to guess was right; the
+     * reduced coverage under concurrency was not, and concurrency is the normal
+     * shape of an agent driving several tools at once.
+     *
+     * Guarantees, all of them enforced by `ToolwallProxy` and asserted in
+     * `test/integration/correlation.test.ts`:
+     *
+     *  - **Present on every context the transport builds** — both legs, both
+     *    directions, notifications and toolwall's own synthetic re-verification
+     *    traffic included. It is optional in the *type* only so that the pre-C-13
+     *    callers that hand-roll a `MessageCorrelation` keep compiling; nothing in
+     *    the request path omits it. Use {@link correlationIdOf}.
+     *  - **Unique.** Never reused within a process, so two concurrent calls can
+     *    never collide, and an MRTR retry gets its own even though it keeps the
+     *    original `exchangeId`.
+     *  - **Opaque.** Process-local, toolwall-authored, never derived from
+     *    anything the peer chose. Not the JSON-RPC id: a client picks those and
+     *    may repeat one.
+     *
+     * For a payload lifted out of `inputRequests`, this is the *enclosing*
+     * round trip's id — the embedded request has no round trip of its own.
+     * `inputRequestKey` distinguishes siblings.
+     */
+    readonly correlationId?: string;
     /**
      * Stable per-proxy identifier for one logical exchange, preserved across an
      * `input_required` round trip even though the JSON-RPC id changes. Opaque;
      * meaningful only within a single toolwall process.
+     *
+     * **Not a pairing key** — see the note above the interface. Use
+     * {@link correlationId} to match a result to its request.
      */
     readonly exchangeId: string;
     /**
@@ -150,8 +203,38 @@ export interface GuardContext {
     /**
      * Where this payload sits in a multi-message exchange. Optional and purely
      * additive: guards written before week 2 ignore it and stay correct.
+     *
+     * **`ToolwallProxy` populates this on every context it builds** — both legs
+     * of a client->server request, both legs of a server->client request, every
+     * relayed notification, every embedded MRTR input request, and toolwall's own
+     * synthetic post-reconnect re-verification. The field stays optional in the
+     * type so that a caller constructing a `GuardContext` by hand (a unit test, a
+     * detector harness) is not forced to invent one; it is not optional in the
+     * request path. `test/integration/correlation.test.ts` asserts the guarantee
+     * against a real proxy rather than restating it here.
      */
     readonly correlation?: MessageCorrelation;
+}
+
+/**
+ * A `GuardContext` that carries a correlation id — what `ToolwallProxy` always
+ * produces, expressed as a type.
+ *
+ * Guards keep taking plain `GuardContext` (a hand-built one in a unit test has
+ * no round trip to correlate with). Narrow with {@link isCorrelated} when the
+ * behaviour differs, or read {@link correlationIdOf} when it does not.
+ */
+export interface CorrelatedGuardContext extends GuardContext {
+    readonly correlation: MessageCorrelation & { readonly correlationId: string };
+}
+
+/** The C-13 correlation id, or `undefined` for a context nothing correlated. */
+export function correlationIdOf(ctx: GuardContext): string | undefined {
+    return ctx.correlation?.correlationId;
+}
+
+export function isCorrelated(ctx: GuardContext): ctx is CorrelatedGuardContext {
+    return typeof ctx.correlation?.correlationId === 'string' && ctx.correlation.correlationId.length > 0;
 }
 
 // ---------------------------------------------------------------------------

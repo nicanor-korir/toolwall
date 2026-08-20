@@ -159,8 +159,14 @@ export class CapabilityGuard implements Guard {
                 ruleId: `toolwall/egress.${note}`,
                 severity: "info",
                 locus: `/arguments${t.pointer}`,
-                message: `URL carries embedded credentials; host was matched as "${decision.hostname}", not as the userinfo portion.`,
-                remediation: "No action required. Recorded because this is the shape of the https://trusted@attacker.tld confusion.",
+                message:
+                  note === "exact-grant-admits-denied-destination"
+                    ? `Host "${decision.hostname}" is a cloud metadata / link-local destination that the default deny list covers, and it was permitted because the operator listed it as an exact host entry.`
+                    : `URL carries embedded credentials; host was matched as "${decision.hostname}", not as the userinfo portion.`,
+                remediation:
+                  note === "exact-grant-admits-denied-destination"
+                    ? "No action required if that grant is deliberate. Recorded every time, because an explicit grant is the only way past this deny list and the audit trail must show who opened it."
+                    : "No action required. Recorded because this is the shape of the https://trusted@attacker.tld confusion.",
                 evidence: { tool: params.name, hostname: decision.hostname },
               });
             }
@@ -466,6 +472,8 @@ function describeEgress(reason: string, detail: string): string {
       return `Host "${detail}" is a bare IP literal and the grant sets allowIpLiterals: false.`;
     case "private-network":
       return `Host "${detail}" is a private/loopback/link-local address reached via a wildcard grant.`;
+    case "denied-destination":
+      return `Destination ${detail} is on the default deny list: no legitimate tool argument names a cloud instance-metadata endpoint or link-local address, and reading one yields the instance's own IAM credentials.`;
     default:
       return `Egress denied (${reason}: ${detail}).`;
   }
@@ -474,6 +482,13 @@ function describeEgress(reason: string, detail: string): string {
 function egressRemediation(reason: string, detail: string, serverId: string, toolName: string, layer: "server" | "tool" | undefined): string {
   if (layer === "server") {
     const hosts = `servers["${serverId}"].egress.hosts`;
+    if (reason === "denied-destination") {
+      return (
+        `Denied by the default deny list, which applies on top of the server-level allowlist for "${serverId}" and is not affected by allowPrivateNetwork or allowIpLiterals. ` +
+        `Add the exact host to ${hosts} (an explicit grant always wins) or set servers["${serverId}"].egress.allowMetadataEndpoints = true if this server legitimately reads instance metadata. ` +
+        "Reading it returns the instance's own IAM credentials, so do neither on a tool whose arguments an LLM chooses."
+      );
+    }
     return (
       `Add "${detail}" to ${hosts} if this destination is intended, or remove the servers["${serverId}"].egress block to stop enforcing a server-level allowlist. ` +
       "The server-level allowlist is deny-by-default and is an upper bound: a per-tool network grant can narrow it but never widen it. " +
@@ -490,6 +505,12 @@ function egressRemediation(reason: string, detail: string, serverId: string, too
       return `Set ${at}.allowIpLiterals = true, or add "${detail}" to ${at}.hosts as an exact entry — an exact entry is an explicit grant and always wins.`;
     case "private-network":
       return `Add "${detail}" to ${at}.hosts as an exact entry (explicit grants always win), or set ${at}.allowPrivateNetwork = true. Note: no DNS resolution is performed, so a public hostname that resolves to a private address is NOT caught by this rule.`;
+    case "denied-destination":
+      return (
+        `This is a default deny, not an allowlist miss: it applies even under a wildcard grant and even when allowPrivateNetwork/allowIpLiterals are true. ` +
+        `If this tool genuinely needs the instance metadata service, add the exact host to ${at}.hosts (an explicit grant always wins) or set ${at}.allowMetadataEndpoints = true. ` +
+        "Do neither on a tool whose arguments an LLM chooses: the MCP specification mandates blocking this destination class for its own OAuth discovery, and reading it returns the instance's IAM credentials."
+      );
     default:
       return `Review ${at}.`;
   }

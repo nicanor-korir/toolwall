@@ -20,6 +20,8 @@ export type {
   ProtocolEra,
   GuardDirection,
   GuardContext,
+  CorrelatedGuardContext,
+  MessageCorrelation,
   FindingSeverity,
   FindingLocus,
   Finding,
@@ -38,6 +40,11 @@ export {
   isReservedMcpErrorCode,
   TOOLWALL_INTERNAL_ERROR,
   TOOLWALL_BLOCKED,
+  // C-13. `correlationId` pairs a RESULT with the REQUEST it answers; `exchangeId` does not and
+  // must never be used for that — an MRTR retry deliberately reuses it, so two live messages can
+  // share one. See the note above `MessageCorrelation` in src/types/protocol.ts.
+  correlationIdOf,
+  isCorrelated,
 } from "../types/protocol.js";
 
 import type { Finding, FindingSeverity, GuardContext } from "../types/protocol.js";

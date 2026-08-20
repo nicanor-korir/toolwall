@@ -76,6 +76,8 @@ const NET_SKELETON: NetworkGrant = {
   schemes: ["https"],
   allowPrivateNetwork: false,
   allowIpLiterals: false,
+  // Default deny for cloud instance metadata and link-local space. See `deniedDestination`.
+  allowMetadataEndpoints: false,
 };
 
 /* ---------------------------------------------------------------- */
@@ -95,10 +97,10 @@ const GRANT_KEYS = new Set([
   "unknownTool",
 ]);
 const FS_KEYS = new Set(["read", "write", "deny", "followSymlinksOutOfRoot", "allowNonexistent"]);
-const NET_KEYS = new Set(["hosts", "schemes", "allowPrivateNetwork", "allowIpLiterals"]);
+const NET_KEYS = new Set(["hosts", "schemes", "allowPrivateNetwork", "allowIpLiterals", "allowMetadataEndpoints"]);
 const BOUNDS_KEYS = new Set(["maxTotalBytes", "maxStringLength", "maxArrayItems", "maxObjectProperties", "maxDepth"]);
 const ROLES_KEYS = new Set(["readPath", "writePath", "url", "host", "deriveUrlFromSchema"]);
-const EGRESS_KEYS = new Set(["enforce", "hosts", "schemes", "allowPrivateNetwork", "allowIpLiterals", "onViolation"]);
+const EGRESS_KEYS = new Set(["enforce", "hosts", "schemes", "allowPrivateNetwork", "allowIpLiterals", "allowMetadataEndpoints", "onViolation"]);
 const RESPONSE_KEYS = new Set(["enabled", "bounds", "outputSchema", "atpa", "inputRequests", "elicitation"]);
 const CONFIRMATION_KEYS = new Set(["maxPrompts", "timeoutMs", "promptableRules"]);
 const SCHEMA_KEYS = new Set(["enabled", "additionalProperties", "requireKnownSchema", "maxPatternLength", "enforceFormats"]);
@@ -167,6 +169,7 @@ function validateGrant(v: unknown, at: string, errors: PolicyError[]): void {
       checkStringArray(net["schemes"], `${at}/network/schemes`, errors);
       checkBool(net["allowPrivateNetwork"], `${at}/network/allowPrivateNetwork`, errors);
       checkBool(net["allowIpLiterals"], `${at}/network/allowIpLiterals`, errors);
+      checkBool(net["allowMetadataEndpoints"], `${at}/network/allowMetadataEndpoints`, errors);
       checkHostList(net["hosts"], `${at}/network/hosts`, errors);
     }
   }
@@ -248,6 +251,7 @@ function validateEgress(v: unknown, at: string, errors: PolicyError[]): void {
   checkStringArray(v["schemes"], `${at}/schemes`, errors);
   checkBool(v["allowPrivateNetwork"], `${at}/allowPrivateNetwork`, errors);
   checkBool(v["allowIpLiterals"], `${at}/allowIpLiterals`, errors);
+  checkBool(v["allowMetadataEndpoints"], `${at}/allowMetadataEndpoints`, errors);
   checkEnum(v["onViolation"], ["block", "confirm", "allow"], `${at}/onViolation`, errors);
   checkHostList(v["hosts"], `${at}/hosts`, errors);
 }
@@ -441,7 +445,7 @@ export function parsePolicy(raw: unknown, opts: ParseOptions = {}): ParseResult 
     perServerEgress.set(sid, mergeEgress(globalEgress, sp.egress as Partial<EgressPolicy> | undefined));
     perServerResponse.set(sid, mergeResponse(globalResponse, sp.response as Partial<ResponsePolicy> | undefined));
     for (const [tn, tg] of Object.entries(sp.tools ?? {})) {
-      const key = `${sid} ${tn}`;
+      const key = `${sid}\u0000${tn}`;
       perTool.set(key, canonicalizeGrantRoots(mergeGrant(sGrant, tg), `/servers/${sid}/tools/${tn}`, probe, errors));
       knownTools.add(key);
     }
@@ -486,7 +490,7 @@ export function parsePolicy(raw: unknown, opts: ParseOptions = {}): ParseResult 
     tier,
     confirmation,
     grantFor(serverId, toolName) {
-      const key = `${serverId} ${toolName}`;
+      const key = `${serverId}\u0000${toolName}`;
       const t = perTool.get(key);
       if (t) return { grant: t, known: true };
       const s = perServer.get(serverId);

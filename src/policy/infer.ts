@@ -50,9 +50,10 @@ import type { ArgumentRoles, CapabilityGrant, FilesystemGrant, NetworkGrant } fr
  * It also never infers a **host allowlist**. It cannot: nothing on the wire says which hosts are
  * legitimate for your deployment, and a guessed allowlist is either useless or an outage. What the
  * inferred network grant enforces is the URL **scheme** (§`INFERRED_SCHEMES`) — which catches
- * `file:///etc/passwd` and `gopher://` handed to a fetch tool, a real LFI/SSRF shape — and nothing
- * more. Host allowlisting stays an operator declaration. Say this plainly rather than implying
- * egress coverage we do not have.
+ * `file:///etc/passwd` and `gopher://` handed to a fetch tool, a real LFI/SSRF shape — plus the
+ * default deny list of cloud instance-metadata and link-local destinations, whose enumeration is
+ * closed and therefore needs no evidence from the wire. Positive host allowlisting stays an
+ * operator declaration. Say this plainly rather than implying egress coverage we do not have.
  *
  * ## Precedence: an explicit operator declaration always wins
  *
@@ -77,7 +78,7 @@ import type { ArgumentRoles, CapabilityGrant, FilesystemGrant, NetworkGrant } fr
  *
  * ## Measured, 2026-08-19 — the gate this had to pass to default ON
  *
- * False positives, 59-case benign request corpus, `balanced` (`test/unit/fp-harness.test.ts`):
+ * False positives, 63-case benign request corpus, `balanced` (`test/unit/fp-harness.test.ts`):
  *
  * | scenario | blocked | confirm | BLOCK RATE | FRICTION RATE |
  * |---|---|---|---|---|
@@ -94,22 +95,31 @@ import type { ArgumentRoles, CapabilityGrant, FilesystemGrant, NetworkGrant } fr
  * | configuration | caught | CATCH RATE |
  * |---|---|---|
  * | day-zero, no inference | 0 / 17 | **0.0%** |
- * | **day-zero + inference** | **15 / 17** | **88.2%** |
+ * | **day-zero + inference** | **16 / 17** | **94.1%** |
  * | hand-written starter policy | 17 / 17 | 100.0% |
  * | hand-written + inference | 17 / 17 | 100.0% |
  *
  * **Read the two numbers together, and read them honestly.** Inference does **not** beat a
- * hand-written policy — 88.2% against 100% — and it is not meant to. What it beats is *what is
- * actually installed*, which is no policy file at all and therefore a 0.0% catch rate. It buys 15
+ * hand-written policy — 94.1% against 100% — and it is not meant to. What it beats is *what is
+ * actually installed*, which is no policy file at all and therefore a 0.0% catch rate. It buys 16
  * of the 17 attacks for zero measured false positives and zero configuration.
  *
- * The 2 it misses are both network-leg, both documented, and both asserted as misses so the gap
- * can neither silently close nor silently widen: an exfiltration POST to an unlisted host, and the
- * `169.254.169.254` cloud-metadata SSRF. Neither is inferable — nothing on the wire says which
- * hosts your deployment trusts, and the benign corpus is full of `http://127.0.0.1:3000` because
- * real developer traffic is. **A declared `egress` block is still what catches those, and the
- * README must keep saying so.** Inference is the floor, not the ceiling, and not a substitute for
- * the one block of configuration that matters most.
+ * The single case it misses is documented and asserted as a miss, so the gap can neither silently
+ * close nor silently widen: an exfiltration POST to an unlisted host. That one is **not
+ * inferable** — nothing on the wire says which hosts your deployment trusts, and a guessed
+ * allowlist is either useless or an outage. **A declared `egress` block is what catches it, and
+ * the README must keep saying so.** Inference is the floor, not the ceiling.
+ *
+ * It was two until the default deny list landed (`deniedDestination` in `./hosts.ts`). The
+ * `169.254.169.254` cloud-metadata SSRF *was* closable without configuration because its
+ * enumeration is closed: a fixed, published set of magic addresses no legitimate tool argument
+ * names, unlike an attacker-chosen hostname. What did NOT change is `allowPrivateNetwork: true` in
+ * the inferred grant. Denying loopback at zero configuration would be a false positive on one of
+ * the commonest benign destinations a developer's session has, and the benign corpus carries
+ * `http://127.0.0.1:3000` for exactly that reason. Metadata and link-local space are denied;
+ * loopback and RFC1918 are not. Measured cost of that split on the 63-case benign corpus: 0
+ * blocked, 0 friction — `toolwall/egress.denied-destination` appears nowhere in its report — and
+ * the loopback/RFC1918 side of the split is asserted directly in `test/unit/hosts.test.ts`.
  */
 
 /* ------------------------------------------------------------------ */
@@ -529,13 +539,22 @@ export function inferProfile(tool: ToolDefinition, opts: InferenceOptions = {}, 
           // enforces is the scheme; host allowlisting stays an operator declaration.
           hosts: [ANY_HOST],
           schemes: opts.schemes ?? INFERRED_SCHEMES,
-          // Both true, and both are honest admissions rather than oversights. The benign corpus
-          // contains `http://127.0.0.1:3000` because localhost dev servers are most of the real
-          // traffic there is, and denying private addresses at zero configuration would break every
-          // local workflow. Inference therefore provides NO SSRF protection; `network.
-          // allowPrivateNetwork: false` in a policy file does.
+          // Both true, and both are honest admissions rather than oversights. Localhost dev
+          // servers are a large share of the HTTP traffic in a real MCP session — the benign corpus
+          // carries `http://127.0.0.1:3000` for that reason — and denying private addresses at zero
+          // configuration would break local workflows wholesale. Inference therefore provides no
+          // *general* SSRF protection;
+          // `network.allowPrivateNetwork: false` in a policy file does.
           allowPrivateNetwork: true,
           allowIpLiterals: true,
+          // The one exception, and the reason it is an exception rather than an inconsistency: the
+          // deny list (`deniedDestination` in ./hosts.ts) covers cloud instance-metadata endpoints
+          // and link-local space only. Nobody's dev server is on `169.254.169.254`, so denying it
+          // costs zero benign calls — measured 0/63, on a corpus carrying four single-label
+          // internal service names precisely so this rule could fail against them — while closing
+          // IMDS credential theft, which
+          // was the single highest-value network-leg attack inference used to miss.
+          allowMetadataEndpoints: false,
         }
       : undefined;
 

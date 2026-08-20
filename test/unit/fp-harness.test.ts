@@ -26,23 +26,42 @@ import { isBlocking } from "../../src/policy/contract.js";
  *   - DAY ZERO       — the user installed toolwall and wrote no `toolwall-policy.json`.
  *   - CONFIGURED     — the operator wrote the starter policy in `test/fixtures/benign/index.ts`.
  *
- * ## Measured result, 2026-08-19, 59-case corpus (run this file to regenerate)
+ * ## Measured result, 2026-08-19, 63-case corpus (run this file to regenerate)
  *
  * | scenario            | tier       | blocked | confirm | BLOCK RATE | FRICTION RATE |
  * |---------------------|------------|---------|---------|------------|---------------|
  * | day-zero            | permissive | 0       | 0       | 0.0%       | 0.0%          |
  * | day-zero            | balanced   | 0       | 0       | 0.0%       | 0.0%          |
- * | day-zero            | strict     | 59      | 0       | 100.0%     | 100.0%        |
+ * | day-zero            | strict     | 63      | 0       | 100.0%     | 100.0%        |
  * | configured          | permissive | 0       | 0       | 0.0%       | 0.0%          |
  * | configured          | balanced   | 0       | 0       | 0.0%       | 0.0%          |
- * | configured          | strict     | 1       | 27      | 1.7%       | 47.5%         |
+ * | configured          | strict     | 1       | 28      | 1.6%       | 46.0%         |
  * | **inferred**        | permissive | **0**   | **0**   | **0.0%**   | **0.0%**      |
  * | **inferred**        | balanced   | **0**   | **0**   | **0.0%**   | **0.0%**      |
- * | inferred            | strict     | 59      | 0       | 100.0%     | 100.0%        |
- * | inferred-notmp      | permissive | 1       | 0       | 1.7%       | 1.7%          |
- * | inferred-notmp      | balanced   | 1       | 0       | 1.7%       | 1.7%          |
+ * | inferred            | strict     | 63      | 0       | 100.0%     | 100.0%        |
+ * | inferred-notmp      | permissive | 1       | 0       | 1.6%       | 1.6%          |
+ * | inferred-notmp      | balanced   | 1       | 0       | 1.6%       | 1.6%          |
  * | inferred+configured | balanced   | 0       | 0       | 0.0%       | 0.0%          |
- * | inferred+configured | strict     | 1       | 27      | 1.7%       | 47.5%         |
+ * | inferred+configured | strict     | 1       | 28      | 1.6%       | 46.0%         |
+ *
+ * ## The four cases added for the single-label metadata deny (round 3)
+ *
+ * The corpus grew 59 -> 63 when `deniedDestination` gained the single-label short forms `metadata`
+ * and `instance-data`. A bare label is a different shape from an FQDN and could plausibly collide
+ * with an internal service name, and the corpus as it stood **contained no single-label hostname
+ * and no `host`-role argument at all** — so a 0.0% reading from it would have measured nothing.
+ * The added cases are the collision, not a demonstration: `http://api:8080/health` (compose/k8s
+ * service naming), `http://metadata-service:8080` (a name CONTAINING the denied label),
+ * `https://metadata.internal.acme.example.com` (a company's own metadata service, whose leftmost
+ * label is the denied one), and a bare `host: "db"` argument on a tool declaring
+ * `format: "hostname"`.
+ *
+ * **`toolwall/egress.denied-destination` fires on 0 of the 63 in every scenario and at every
+ * tier.** The starter policy's host list gained `api`, `metadata-service` and `db` alongside it,
+ * because that policy is modelled as what an operator writes after looking at their own traffic
+ * and those three ARE their traffic — leaving them out would have measured a mis-specified
+ * fixture rather than a rule. `memory`'s citation host is still deliberately absent, so
+ * `enforce: "scan"` still costs exactly the one case it always cost.
  *
  * **The inference gate (Week 3).** `inferred` at `balanced` is the row that decides whether
  * inferred capability policy may default ON, and it measures **0.0% blocked / 0.0% friction** —
@@ -389,7 +408,10 @@ describe("false-positive harness (benign corpus)", () => {
       const original = cap.inspect({ name: c.tool.name, arguments: c.args }, ctx);
 
       // Replace every string that is NOT bound to a capability role with dangerous-looking text.
-      const roleBound = new Set(["path", "paths", "repo_path", "source", "destination", "url"]);
+      // Every argument name the starter policy or a `format` declaration binds to a capability
+      // role. `host` is here because a `format: "hostname"` property IS role-bound — replacing its
+      // value changes what the call reaches, which is the guard working, not content inspection.
+      const roleBound = new Set(["path", "paths", "repo_path", "source", "destination", "url", "host"]);
       const mutated: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(c.args)) {
         mutated[k] = roleBound.has(k) ? v : typeof v === "string" ? "`; rm -rf /` ../../../etc/passwd $(whoami)" : v;

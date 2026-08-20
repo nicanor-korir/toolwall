@@ -48,15 +48,17 @@ describe('Round 2 · MRTR resultType confusion does NOT bypass ResultGuard (defe
     });
 });
 
-describe('Round 2 · LATENT bug in isPrivateAddress (reported, NOT a reachable bypass)', () => {
-    // `[::ffff:127.0.0.1]` is normalized by the WHATWG URL parser to `[::ffff:7f00:1]`. The
-    // IPv4-mapped detection in isPrivateAddress does `inner.split(":").pop()` -> "1", so it fails to
-    // recognise the compressed hextet form and returns FALSE for a loopback address.
-    it('misclassifies compressed IPv4-mapped IPv6 loopback/private as non-private', () => {
-        expect(isPrivateAddress('[::ffff:127.0.0.1]')).toBe(true); // decimal form: caught
-        // BUG: the parser-normalized compressed form of the SAME address is missed.
-        expect(isPrivateAddress('[::ffff:7f00:1]')).toBe(false); // <-- should be true
-        expect(isPrivateAddress('[::ffff:a00:1]')).toBe(false); // 10.0.0.1, also missed
+describe('Round 2 · isPrivateAddress — compressed IPv4-mapped IPv6 (reported, now FIXED)', () => {
+    // Originally reported as a latent bug: `[::ffff:127.0.0.1]` is normalized by the WHATWG URL
+    // parser to `[::ffff:7f00:1]`, and the old IPv4-mapped detection did `inner.split(":").pop()`
+    // -> "1", so it failed to recognise the compressed hextet form and returned FALSE for loopback.
+    // Dev 3 replaced the string-prefix IPv6 matching with a real 8-hextet parser. These now assert
+    // the FIXED behaviour; the payloads are kept so the regression stays covered.
+    it('recognises every spelling of the same mapped loopback / private address', () => {
+        expect(isPrivateAddress('[::ffff:127.0.0.1]')).toBe(true); // decimal form
+        expect(isPrivateAddress('[::ffff:7f00:1]')).toBe(true); // WHATWG-compressed form of the SAME address
+        expect(isPrivateAddress('[::ffff:a00:1]')).toBe(true); // 10.0.0.1, compressed
+        expect(isPrivateAddress('[0:0:0:0:0:ffff:7f00:1]')).toBe(true); // fully expanded
     });
 
     it('but it is NOT reachable through evaluateUrl: private checks run only on the wildcard path, ' +

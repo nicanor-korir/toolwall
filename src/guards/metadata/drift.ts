@@ -50,7 +50,21 @@
  * sight is pinned as-is under trust-on-first-use. That is the known weakness of TOFU and the
  * reason `mode: "strict"` exists. Judging whether a definition is *hostile* is the job of the
  * Week 2 detectors, and those are heuristics with a false-positive rate, not proofs.
+ *
+ * ## The pin-time assessment
+ *
+ * Because that weakness is real and every supply-chain case in T-09 is a *first-sighting* attack,
+ * this guard runs `assessPinCandidate()` (see `./assess.ts`) exactly once, at the moment a pin
+ * decision is actually pending — never on a listing whose every subject is already pinned, and
+ * never on `tools/call`. The result rides on the `pinned` event as {@link PinEvent.assessment}
+ * under TOFU, and is rendered into the `toolwall/pin-unpinned` finding under `strict`, which is
+ * the confirmation prompt a human answers.
+ *
+ * It changes no verdict. Nothing in this guard blocks on an aggregate, and the assessment does not
+ * produce one to block on.
  */
+import type { PinCandidate, PinRiskAssessment } from "./assess.js";
+import { assessPinCandidate, assessmentFinding } from "./assess.js";
 import type { CanonicalizeOptions } from "./canonicalize.js";
 import { CANONICALIZATION_VERSION, CanonicalizationError, canonicalizeAndHash } from "./canonicalize.js";
 import type { FieldDiff } from "./diff.js";
@@ -65,6 +79,7 @@ import {
 } from "./surface.js";
 import type { PinDecision, PinRecord, PinScope, PinStore } from "../../audit/manifest.js";
 import { DEFAULT_PIN_SCOPE } from "../../audit/manifest.js";
+import type { ProvenanceReport } from "../../audit/provenance.js";
 import type { Finding, Guard, GuardContext, ProtocolEra, Verdict } from "../../types/protocol.js";
 import { ALLOW, TOOLWALL_BLOCKED } from "../../types/protocol.js";
 
@@ -108,6 +123,19 @@ export interface PinEvent {
   readonly pinKind: PinKind;
   readonly subject: string;
   readonly message: string;
+  /**
+   * The pin-time risk assessment, on the FIRST `pinned` event of a listing that adopted anything.
+   *
+   * Present only on `"pinned"`, only once per listing, and only when the assessment ran — which it
+   * does whenever a pin decision was actually pending. `message` already carries its one-line
+   * headline, so a consumer that ignores this field still gets the summary in the audit log; a
+   * consumer that reads it gets `assessment.rendered`, the full report.
+   *
+   * Additive and optional on purpose: nothing that already consumes `PinEvent` has to change, and
+   * no new event kind was introduced, so the pin event stream is byte-identical for any consumer
+   * that does not ask for this.
+   */
+  readonly assessment?: PinRiskAssessment;
 }
 
 export interface DriftReport {
@@ -185,6 +213,38 @@ export interface MetadataPinGuardOptions {
    * `src/audit/manifest.ts`; `deriveScopeId` refuses credential-shaped input for this reason.
    */
   readonly resolveScope?: (ctx: GuardContext) => PinScope;
+  /**
+   * Pin-time risk assessment. **On by default** — it is pure, offline, bounded string work that
+   * runs only when a pin decision is pending, and turning it off means a human is asked to grant
+   * trust with nothing in front of them, which is the state this option exists to end.
+   *
+   * Pass `false` to disable it, or an object to feed it the two opt-in inputs it cannot obtain
+   * for itself. Absent inputs are reported as "not checked" in the report rather than silently
+   * omitted.
+   */
+  readonly assess?: false | PinAssessmentOptions;
+}
+
+/**
+ * The inputs to {@link assessPinCandidate} that this guard cannot produce on its own.
+ *
+ * Both are opt-in elsewhere in the product and both stay opt-in here. Supplying neither is the
+ * default and produces a report that says, in as many words, which two checks did not run.
+ */
+export interface PinAssessmentOptions {
+  /**
+   * Advisory `agent-threat-rules` findings for this payload. The scanner is the caller's
+   * (`AtrScanner.create()`); this guard never constructs one, for the reasons in `./rules.ts`.
+   */
+  readonly atrFindings?: (payload: unknown, ctx: GuardContext) => readonly Finding[];
+  /**
+   * The completed T-09 provenance report for this server, when one exists.
+   *
+   * A function rather than a value because provenance is asynchronous and may not have finished
+   * when the first listing arrives; returning `undefined` is the normal case and is reported as
+   * "not checked", which is deliberately not the same thing as "clean".
+   */
+  readonly provenance?: (serverId: string) => ProvenanceReport | undefined;
 }
 
 interface LiveEntry {
@@ -192,6 +252,16 @@ interface LiveEntry {
   /** Detached, NFC-normalized copy of the definition. Never aliases the live payload. */
   readonly definition: unknown;
   readonly observedAt: string;
+}
+
+/**
+ * A one-shot holder for the listing's assessment.
+ *
+ * Mutable and passed down on purpose: the report is about the listing, so exactly one of the
+ * per-subject outcomes should carry it. Whichever gets there first takes it and empties the box.
+ */
+interface AssessmentBox {
+  assessment: PinRiskAssessment | undefined;
 }
 
 interface ServerState {
@@ -241,10 +311,19 @@ export class MetadataPinGuard implements Guard {
   readonly #unpinnedFields: readonly string[] | undefined;
   readonly #resolveScope: (ctx: GuardContext) => PinScope;
 
+  readonly #assess: false | PinAssessmentOptions;
+
   /** serverId -> last observed definitions and their hashes. */
   readonly #live = new Map<string, ServerState>();
   /** Drift reports awaiting a human decision. Nothing listed here is callable. */
   readonly #quarantine = new Map<string, DriftReport>();
+  /**
+   * serverId -> the `instructions` this server sent, so a `tools/list` assessment can include the
+   * highest-severity injection surface the spec has instead of reporting it as unavailable.
+   */
+  readonly #instructions = new Map<string, string>();
+  /** serverId -> the most recent pin-time assessment, for an operator UI that wants to re-read it. */
+  readonly #assessments = new Map<string, PinRiskAssessment>();
 
   constructor(options: MetadataPinGuardOptions) {
     this.#store = options.store;
@@ -257,6 +336,7 @@ export class MetadataPinGuard implements Guard {
     this.#canonicalizeOptions = options.canonicalizeOptions ?? {};
     this.#unpinnedFields = options.unpinnedFields;
     this.#resolveScope = options.resolveScope ?? (() => DEFAULT_PIN_SCOPE);
+    this.#assess = options.assess ?? {};
   }
 
   // -------------------------------------------------------------------------
@@ -313,6 +393,28 @@ export class MetadataPinGuard implements Guard {
 
     this.#noteCacheDirectives(result, ctx, scope);
 
+    /*
+     * The pin-time assessment, run once and only when a decision is actually pending.
+     *
+     * "Pending" is checked against the store first, with the same cheap map lookup `#reconcile`
+     * will do anyway, so a listing whose every tool is already pinned costs nothing. That is the
+     * difference between "runs at pin time" and "runs on every listing": a server that re-lists on
+     * a timer would otherwise re-render the same report forever and the report would stop being
+     * read, which is the alert-fatigue failure this codebase keeps designing against.
+     */
+    const pinPending = tools.some((tool) => {
+      if (tool === null || typeof tool !== "object" || Array.isArray(tool)) return true;
+      const name = (tool as Record<string, unknown>)["name"];
+      if (typeof name !== "string" || name.length === 0) return true;
+      return this.#store.get(ctx.serverId, "tool", name, scope) === undefined;
+    });
+    const box: AssessmentBox = {
+      assessment:
+        pinPending && this.#assess !== false
+          ? this.#assess1(ctx, { serverId: ctx.serverId, tools, ...this.#atr(result, ctx), ...this.#prov(ctx) })
+          : undefined,
+    };
+
     const findings: Finding[] = [];
     let blocked = false;
     const seen = new Set<string>();
@@ -346,7 +448,7 @@ export class MetadataPinGuard implements Guard {
       }
 
       seen.add(toolName);
-      const outcome = this.#reconcile(ctx, scope, "tool", toolName, definition, locus);
+      const outcome = this.#reconcile(ctx, scope, "tool", toolName, definition, locus, box);
       if (outcome.finding !== undefined) findings.push(outcome.finding);
       if (outcome.blocked) blocked = true;
     }
@@ -385,6 +487,10 @@ export class MetadataPinGuard implements Guard {
     let definition: Record<string, unknown>;
     try {
       definition = extractServerSurface(result);
+      const instructions = definition["instructions"];
+      // Remembered so the next `tools/list` assessment can include the field the spec designs to
+      // be placed straight into the client's system prompt, rather than reporting it as unseen.
+      if (typeof instructions === "string") this.#instructions.set(ctx.serverId, instructions);
     } catch (error) {
       return this.#block([
         finding({
@@ -396,13 +502,29 @@ export class MetadataPinGuard implements Guard {
         }),
       ]);
     }
+    const scope = this.#resolveScope(ctx);
+    const pinPending =
+      this.#store.get(ctx.serverId, "server", SERVER_INSTRUCTIONS_SUBJECT, scope) === undefined;
+    const instructions = definition["instructions"];
+    const box: AssessmentBox = {
+      assessment:
+        pinPending && this.#assess !== false && typeof instructions === "string"
+          ? this.#assess1(ctx, {
+              serverId: ctx.serverId,
+              instructions,
+              ...this.#atr(result, ctx),
+              ...this.#prov(ctx),
+            })
+          : undefined,
+    };
     const outcome = this.#reconcile(
       ctx,
-      this.#resolveScope(ctx),
+      scope,
       "server",
       SERVER_INSTRUCTIONS_SUBJECT,
       definition,
       "/instructions",
+      box,
     );
     if (outcome.blocked) {
       return this.#block(outcome.finding === undefined ? [] : [outcome.finding]);
@@ -671,6 +793,7 @@ export class MetadataPinGuard implements Guard {
     subject: string,
     definition: Record<string, unknown>,
     locus: string,
+    box: AssessmentBox = { assessment: undefined },
   ): { blocked: boolean; finding?: Finding } {
     let hash: string;
     let detached: unknown;
@@ -710,18 +833,39 @@ export class MetadataPinGuard implements Guard {
 
     if (pin === undefined) {
       if (this.#mode === "tofu") {
-        this.#adopt(ctx, scope, kind, subject, live);
+        this.#adopt(ctx, scope, kind, subject, live, box);
         return { blocked: false };
       }
+      /*
+       * Strict mode. This finding IS the decision surface: it routes through the confirmation
+       * provider, so its `message` is what a human reads before they approve a server they have
+       * never seen. Handing them a hash and the word "unpinned" and calling that a decision is
+       * what the pin-time assessment exists to stop, so the whole report goes in the message.
+       *
+       * Only on the first unpinned subject of the listing (`box` is emptied after it is used):
+       * the assessment is about the listing, and repeating it once per tool would bury it.
+       */
+      const assessment = box.assessment;
+      box.assessment = undefined;
+      const report = assessment === undefined ? undefined : assessmentFinding(assessment, locus);
       return {
         blocked: false,
         finding: finding({
           ruleId: "toolwall/pin-unpinned",
           severity: "medium",
-          message: `"${subject}" has never been approved and strict mode does not adopt definitions on its own`,
+          message:
+            `"${subject}" has never been approved and strict mode does not adopt definitions on its own` +
+            (report === undefined ? "" : `\n\n${report.message}`),
           locus,
           remediation: "Review this definition and approve it before the tool can be called.",
-          evidence: { serverId: ctx.serverId, scope, kind, subject, hash },
+          evidence: {
+            serverId: ctx.serverId,
+            scope,
+            kind,
+            subject,
+            hash,
+            ...(report?.evidence === undefined ? {} : { assessment: report.evidence }),
+          },
         }),
       };
     }
@@ -785,6 +929,7 @@ export class MetadataPinGuard implements Guard {
     kind: PinKind,
     subject: string,
     live: LiveEntry,
+    box: AssessmentBox = { assessment: undefined },
   ): void {
     this.#store.pinIfAbsent({
       serverId: ctx.serverId,
@@ -803,7 +948,76 @@ export class MetadataPinGuard implements Guard {
           "that was already hostile when first seen",
       },
     });
-    this.#emit("pinned", ctx.serverId, scope, kind, subject, "pinned on first sighting (TOFU)");
+    /*
+     * The assessment rides on the first `pinned` event of the listing and its headline is folded
+     * into the message, so it reaches the audit log and every existing `onPinEvent` consumer
+     * without a new event kind and without anyone having to opt in. Emptied after one use: the
+     * report describes the listing, not the tool, and printing it once per tool would bury it.
+     */
+    const assessment = box.assessment;
+    box.assessment = undefined;
+    this.#emit(
+      "pinned",
+      ctx.serverId,
+      scope,
+      kind,
+      subject,
+      assessment === undefined
+        ? "pinned on first sighting (TOFU)"
+        : `pinned on first sighting (TOFU) · ${assessment.headline}`,
+      assessment,
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Pin-time assessment plumbing
+  // -------------------------------------------------------------------------
+
+  /** The most recent pin-time assessment for a server, for an operator UI that wants to re-read it. */
+  lastAssessment(serverId: string): PinRiskAssessment | undefined {
+    return this.#assessments.get(serverId);
+  }
+
+  /**
+   * Run the assessment, remember it, and never let it break the listing path.
+   *
+   * A thrown assessment would take a `tools/list` down with it, which would turn an advisory
+   * evidence sheet into an availability bug. It is wrapped for that reason and for no other; the
+   * function itself is written not to throw.
+   */
+  #assess1(ctx: GuardContext, candidate: PinCandidate): PinRiskAssessment | undefined {
+    try {
+      const instructions = this.#instructions.get(ctx.serverId);
+      const assessment = assessPinCandidate({
+        ...candidate,
+        ...(candidate.instructions === undefined && instructions !== undefined ? { instructions } : {}),
+      });
+      this.#assessments.set(ctx.serverId, assessment);
+      return assessment;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Advisory ATR findings for this payload, when the operator supplied a scanner. */
+  #atr(payload: unknown, ctx: GuardContext): { atrFindings?: readonly Finding[] } {
+    if (this.#assess === false || this.#assess.atrFindings === undefined) return {};
+    try {
+      return { atrFindings: this.#assess.atrFindings(payload, ctx) };
+    } catch {
+      return {};
+    }
+  }
+
+  /** The completed T-09 report, when the operator opted in and it has finished. */
+  #prov(ctx: GuardContext): { provenance?: ProvenanceReport } {
+    if (this.#assess === false || this.#assess.provenance === undefined) return {};
+    try {
+      const report = this.#assess.provenance(ctx.serverId);
+      return report === undefined ? {} : { provenance: report };
+    } catch {
+      return {};
+    }
   }
 
   #recordDrift(
@@ -924,7 +1138,16 @@ export class MetadataPinGuard implements Guard {
     pinKind: PinKind,
     subject: string,
     message: string,
+    assessment?: PinRiskAssessment,
   ): void {
-    this.#onEvent({ kind, serverId, scope, pinKind, subject, message });
+    this.#onEvent({
+      kind,
+      serverId,
+      scope,
+      pinKind,
+      subject,
+      message,
+      ...(assessment === undefined ? {} : { assessment }),
+    });
   }
 }

@@ -168,7 +168,14 @@ export function starterPolicyDocument(ws: Workspace): Record<string, unknown> {
       http: {
         defaults: {
           network: {
-            hosts: ["api.example.com", "*.example.com", "127.0.0.1"],
+            // The three public/loopback entries plus the internal service names this deployment's
+            // own traffic uses. An operator who writes an allowlist writes it against the traffic
+            // they see, and `http://api:8080/health` and a `db` host appear in that traffic every
+            // day — omitting them would not be measuring a rule, it would be measuring a
+            // mis-specified fixture. `metadata.internal.acme.example.com` is covered by the
+            // `*.example.com` wildcard, and `memory`'s citation host is deliberately still absent
+            // so `enforce: "scan"` keeps costing what it costs.
+            hosts: ["api.example.com", "*.example.com", "127.0.0.1", "api", "metadata-service", "db"],
             schemes: ["https", "http"],
             allowIpLiterals: false,
             allowPrivateNetwork: false,
@@ -178,6 +185,7 @@ export function starterPolicyDocument(ws: Workspace): Record<string, unknown> {
           // `url` roles come from the tools' own `"format": "uri"` declarations.
           http_request: { mutates: true },
           fetch: { ...readOnly },
+          db_ping: { ...readOnly, roles: { host: ["/host"] } },
         },
       },
       github: { tools: { create_issue: { mutates: true } } },
@@ -211,7 +219,7 @@ export function egressPolicyDocument(ws: Workspace, enforce: "roles" | "scan"): 
     ...starterPolicyDocument(ws),
     egress: {
       enforce,
-      hosts: ["api.example.com", "*.example.com", "127.0.0.1"],
+      hosts: ["api.example.com", "*.example.com", "127.0.0.1", "api", "metadata-service", "db"],
       schemes: ["https", "http"],
     },
   };

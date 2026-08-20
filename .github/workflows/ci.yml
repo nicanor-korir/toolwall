@@ -1,0 +1,176 @@
+# toolwall CI
+#
+# What gates a merge, and what deliberately does not.
+#
+# GATES:  typecheck, the full test suite, the C-22 wiring-completeness test, the packed-artifact
+#         smoke test, and the optional-dependency-absent path. All of these are deterministic:
+#         they either pass or the code is wrong, and a red result is always actionable.
+#
+# DOES NOT GATE: the latency benchmark. It runs, its output is uploaded, and its exit code is
+#         swallowed. This is a deliberate decision, not laziness. `bench/latency.ts` measures
+#         sub-millisecond deltas between four process configurations; on a shared GitHub runner
+#         with noisy neighbours we observed p99 outliers of 44-138 ms against budgets of 1-10 ms.
+#         A perf gate that fails for reasons the author cannot reproduce or fix does not protect
+#         latency — it teaches the team that red CI is normal, and that habit then swallows the
+#         real failures above it. Latency is defended by running `npm run bench` on a known host
+#         (the README records the reference numbers), not by a coin flip on shared infrastructure.
+#
+# The wiring-completeness test is called out as its own step even though `npm test` already
+# includes it. It is the anti-recurrence check for "module shipped, tested, and never wired"
+# (C-22, three occurrences). Naming it separately means the CI log says which invariant broke.
+
+name: ci
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: node ${{ matrix.node }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # engines.node is ">=20". Test the floor, and the current LTS lines above it.
+        node: ['20', '22', '24']
+        os: [ubuntu-latest]
+        include:
+          # One macOS leg on the LTS: the CLI spawns child processes and touches the filesystem
+          # for the pin store and audit log, and those are the parts that differ per platform.
+          - node: '22'
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: install
+        run: npm ci
+
+      - name: typecheck
+        run: npm run typecheck
+
+      - name: build
+        run: npm run build
+
+      - name: full test suite
+        run: npm test
+
+      - name: wiring completeness (C-22)
+        run: npx vitest run test/integration/wiring-completeness.test.ts
+
+  package:
+    name: packed artifact is installable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: install
+        run: npm ci
+
+      - name: build
+        run: npm run build
+
+      - name: pack
+        run: |
+          npm pack --dry-run
+          npm pack
+
+      # Installing the tarball into a scratch project proves the `files` list is complete and that
+      # `bin` resolves. A `dist` that builds locally but ships a broken `exports` map is the
+      # classic first-release bug, and it is only visible from outside the repo.
+      - name: install the tarball into a clean project and run the documented invocation
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/consumer && cd /tmp/consumer
+          npm init -y >/dev/null
+          npm install "$GITHUB_WORKSPACE"/toolwall-*.tgz
+          # The binary must exist and answer --version / --help without a downstream server.
+          npx toolwall --version
+          npx toolwall --help
+          # And it must actually proxy: the fixture server from the repo, through the packed CLI.
+          node "$GITHUB_WORKSPACE/.github/scripts/packed-smoke.mjs"
+
+  optional-dep-absent:
+    name: degrades cleanly without agent-threat-rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # Install fully and build FIRST, then remove the optional package.
+      #
+      # This models the real consumer situation rather than a convenient one. A consumer installs
+      # toolwall from npm as prebuilt `dist/` and never runs `tsc`; what they may lack is the
+      # optional package at RUNTIME. Building without it would be testing something nobody does —
+      # and would fail for an unrelated reason, because `src/guards/metadata/rules.ts` imports the
+      # specifier for its types and TypeScript resolves that at compile time even though the
+      # import is dynamic and guarded. Compile with it, run without it.
+      - name: install
+        run: npm ci
+
+      - name: build
+        run: npm run build
+
+      - name: remove the optional package, exactly as --omit=optional would leave it
+        run: |
+          set -eux
+          rm -rf node_modules/agent-threat-rules node_modules/.bin/agent-threat-rules
+          test ! -d node_modules/agent-threat-rules
+          echo "agent-threat-rules is absent, as intended"
+
+      - name: the absent-path suite
+        run: npx vitest run test/integration/optional-dep-absent.test.ts
+
+  bench:
+    name: benchmark (informational, never gates)
+    runs-on: ubuntu-latest
+    # Never blocks a merge. See the header comment: shared runners produce 44-138 ms p99 outliers
+    # against millisecond budgets, and a flaky perf gate trains people to ignore CI.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: install
+        run: npm ci
+
+      # Fewer iterations than the local default: this run is for the trend and the attribution
+      # table, not for a defensible p99. The reference numbers in the README come from a known host.
+      - name: run benchmark
+        env:
+          TOOLWALL_BENCH_N: '300'
+          TOOLWALL_BENCH_WARMUP: '50'
+        run: npm run bench 2>&1 | tee bench-output.txt || true
+
+      - name: upload benchmark output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-output
+          path: bench-output.txt
+          if-no-files-found: warn

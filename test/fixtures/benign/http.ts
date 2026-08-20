@@ -56,6 +56,29 @@ const githubIssue: ToolDefinition = {
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
 };
 
+/**
+ * A tool whose host argument is a BARE hostname, declared `format: "hostname"`.
+ *
+ * The corpus had no such tool, which meant the whole `host`-role leg — `evaluateHost`, its
+ * synthetic-scheme parse, and every deny-list decision reached through it — was unmeasured. A
+ * database, cache, SMTP or SSH client is the ordinary shape that supplies its own scheme, and it
+ * is also the shape most likely to be pointed at a single-label internal name.
+ */
+const dbConnect: ToolDefinition = {
+  name: "db_ping",
+  description: "Check connectivity to a database host.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      host: { type: "string", format: "hostname" },
+      port: { type: "integer", minimum: 1, maximum: 65535 },
+      timeout_ms: { type: "integer", minimum: 1, maximum: 60000 },
+    },
+    required: ["host"],
+  },
+  annotations: { readOnlyHint: true, openWorldHint: true },
+};
+
 export const httpCases: readonly BenignCase[] = [
   {
     id: "http.get-with-query-string",
@@ -158,6 +181,42 @@ export const httpCases: readonly BenignCase[] = [
     },
     trap: "A security bug report. It contains a traversal payload, a curl command AND the literal phrase 'ignore previous instructions' — as quoted evidence. Injection detectors score this very high; it is the most common FP in real security teams.",
     tags: ["dot-dot", "shell-syntax", "injection-lookalike"],
+  },
+  {
+    id: "http.docker-compose-service-url",
+    serverId: "http",
+    tool: httpRequest,
+    args: { url: "http://api:8080/health", method: "GET", timeout_ms: 5000 },
+    trap:
+      "A SINGLE-LABEL hostname. Docker Compose and Kubernetes resolve bare service names, so this is what service-to-service traffic actually looks like — and it is the shape the cloud-metadata short-form deny (`metadata`, `instance-data`) could collide with. If that rule were a suffix test or a broader vocabulary, this breaks.",
+    tags: ["url", "single-label-host", "ssrf-tension"],
+  },
+  {
+    id: "http.near-miss-metadata-service-name",
+    serverId: "http",
+    tool: fetchPage,
+    args: { url: "http://metadata-service:8080/v1/catalog" },
+    trap:
+      "An internal service whose name CONTAINS the denied short form `metadata`. Substring or prefix matching on the deny-list flags it; exact single-label matching does not. Naming a service `metadata-service` is entirely ordinary.",
+    tags: ["url", "single-label-host", "deny-list-near-miss"],
+  },
+  {
+    id: "http.near-miss-metadata-subdomain-of-own-zone",
+    serverId: "http",
+    tool: fetchPage,
+    args: { url: "https://metadata.internal.acme.example.com/api/v1/schemas" },
+    trap:
+      "A company's OWN metadata service, on their own zone. It starts with the label `metadata` and it is not any cloud's IMDS. A deny keyed on the leftmost label rather than on the whole name flags this.",
+    tags: ["url", "deny-list-near-miss"],
+  },
+  {
+    id: "http.bare-host-argument-single-label",
+    serverId: "http",
+    tool: dbConnect,
+    args: { host: "db", port: 5432, timeout_ms: 2000 },
+    trap:
+      "A bare `host`-role argument naming a single-label internal host — the compose/k8s convention. Exercises `evaluateHost`, whose synthetic scheme is NOT a WHATWG special scheme, and is the exact collision shape a single-label deny risks.",
+    tags: ["host-role", "single-label-host", "ssrf-tension"],
   },
   {
     id: "http.enum-boundary-delete",

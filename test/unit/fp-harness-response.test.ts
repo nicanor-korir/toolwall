@@ -27,9 +27,27 @@ import { isBlocking, type Finding, type GuardContext, type ToolDefinition, type 
  *
  * | tier       | results | sequences | elicitations | BLOCKED | FRICTION |
  * |------------|---------|-----------|--------------|---------|----------|
- * | permissive | 10      | 5         | 5            | 0       | 0.0%     |
- * | balanced   | 10      | 5         | 5            | 0       | 0.0%     |
- * | strict     | 10      | 5         | 5            | 1       | 5.0%     |
+ * | permissive | 10      | 9         | 5            | 0       | 0.0%     |
+ * | balanced   | 10      | 9         | 5            | 0       | 0.0%     |
+ * | strict     | 10      | 9         | 5            | 1       | 4.2%     |
+ *
+ * The sequence corpus went from 5 to 9 across two widenings of the ATPA correlation window, and
+ * each widening added the cases the previous design was structurally incapable of failing —
+ * re-reading an FP number on a corpus that cannot reach the new behaviour measures nothing.
+ *
+ *  - Single consumed slot -> bounded per-server ring: a two-step recovery with an interposed call,
+ *    a cross-tool call carrying a parameter the previous tool's error text named, and a three-deep
+ *    retry storm putting several live error records in the ring at once.
+ *  - Per-server ring -> **per-TOOL keying** (C-13): unrelated interleaved traffic no longer ages a
+ *    tool's error record at all, so `seq.long-gap-then-declared-argument` returns to a tool four
+ *    calls after its error with the record still live.
+ *
+ * The sequence lane also runs with the C-13 `correlationId` on every step, so it measures the
+ * shipped correlation path rather than the no-id fallback.
+ *
+ * **ATPA fires on 0 of the 9 at every tier**, and the only benign block anywhere in the table is
+ * still the pre-existing `outputSchema` one. The widening bought two closed evasions and a closed
+ * concurrency gap for no measured false positive.
  *
  * The single strict block is `result.weather-extra-fields`: a server returning MORE than its
  * published `outputSchema` declares. Under-specified output schemas are the common real-world
@@ -63,6 +81,11 @@ interface Report {
 
 function ctx(serverId: string, direction: GuardContext["direction"], method: string): GuardContext {
   return { era: "2025-11-25", serverId, direction, method };
+}
+
+/** A `tools/call` context carrying the C-13 correlation id, as `ToolwallProxy` builds it. */
+function correlated(serverId: string, direction: GuardContext["direction"], correlationId: string): GuardContext {
+  return { era: "2025-11-25", serverId, direction, method: "tools/call", correlation: { exchangeId: `x_${correlationId}`, correlationId } };
 }
 
 function worst(actions: readonly Verdict["action"][]): Verdict["action"] {
@@ -101,16 +124,24 @@ function runTier(tier: StrictnessTier): Report {
   }
 
   // --- sequences (the ATPA rule's false-positive surface) ------------
+  //
+  // Each step carries the C-13 `correlationId` the transport mints per round trip, so this
+  // measures the SHIPPED correlation path rather than the fallback a context with no id takes.
+  // Sequences here are strictly ordered, so a result answers the call immediately before it.
   for (const c of benignSequenceCases) {
     const audited: Finding[] = [];
     const guard = new ResultGuard({ policy, tools, audit: (f) => void audited.push(...f) });
     const verdicts: Verdict[] = [];
+    let round = 0;
+    let openId = "";
     for (const step of c.steps) {
-      verdicts.push(
-        step.kind === "call"
-          ? guard.inspect({ name: step.name, arguments: step.arguments }, ctx(c.serverId, "request", "tools/call"))
-          : guard.inspect(step.result, ctx(c.serverId, "response", "tools/call")),
-      );
+      if (step.kind === "call") {
+        round += 1;
+        openId = `${c.id}#${round}`;
+        verdicts.push(guard.inspect({ name: step.name, arguments: step.arguments }, correlated(c.serverId, "request", openId)));
+      } else {
+        verdicts.push(guard.inspect(step.result, correlated(c.serverId, "response", openId)));
+      }
     }
     record(c.id, verdicts, audited);
   }
