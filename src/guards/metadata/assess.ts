@@ -87,6 +87,7 @@
  * work over a payload the canonicalizer has already walked. It never runs on `tools/call`.
  */
 import { DEFAULT_HAZARD_POLICY, decodeTagBlock, scanSurface, type SurfaceHazard } from "./unicode.js";
+import { rendered, renderText, type Rendered } from "../../audit/render.js";
 import type { ProvenanceReport } from "../../audit/provenance.js";
 import type { Finding } from "../../types/protocol.js";
 
@@ -102,12 +103,12 @@ export type AssessmentLane = "deterministic" | "structural" | "advisory" | "prov
 
 /** One occurrence of a signal, kept so a grouped signal can still show where it came from. */
 export interface SignalExample {
-  /** RFC 6901 JSON Pointer into the listing. */
-  readonly locus: string;
-  /** The quoted evidence, rendered invisible-safe. */
-  readonly detail: string;
-  /** Tool name, when the occurrence belongs to a tool. */
-  readonly subject?: string;
+  /** RFC 6901 JSON Pointer into the listing. Sanitized: object KEYS are server-controlled. */
+  readonly locus: Rendered;
+  /** The quoted evidence. */
+  readonly detail: Rendered;
+  /** Tool name, when the occurrence belongs to a tool. Sanitized: names are server-controlled. */
+  readonly subject?: Rendered;
 }
 
 /**
@@ -127,21 +128,21 @@ export interface RiskSignal {
   readonly id: string;
   readonly lane: AssessmentLane;
   /** One line. What was observed, never a safety claim (`docs/THREAT-MODEL.md` §3 rule 2). */
-  readonly headline: string;
-  /** The quoted evidence for the first occurrence, rendered invisible-safe. */
-  readonly detail: string;
+  readonly headline: Rendered;
+  /** The quoted evidence for the first occurrence. */
+  readonly detail: Rendered;
   /** RFC 6901 JSON Pointer into the listing, or `""` when the signal is about the listing itself. */
-  readonly locus: string;
+  readonly locus: Rendered;
   /**
    * Tool names this concerns, bounded by {@link MAX_SUBJECTS_PER_SIGNAL}. When the rule fired on
    * more than that, {@link omittedSubjects} says how many are not listed — never nothing.
    */
-  readonly subjects: readonly string[];
+  readonly subjects: readonly Rendered[];
   /**
    * What this signal is worth and what it cannot tell you — printed next to it, every time.
    * A signal whose confidence line cannot be written honestly does not belong in this file.
    */
-  readonly confidence: string;
+  readonly confidence: Rendered;
   /**
    * How many times this rule fired across the listing. Always ≥ 1.
    *
@@ -177,6 +178,14 @@ export const FLOOD_DUPLICATE_NAMES = 10;
 export const MAX_SCANNED_SENTENCES = 50_000;
 /** Occurrences quoted inline on one signal. */
 export const MAX_EXAMPLES_PER_SIGNAL = 3;
+/**
+ * Characters of a tool name that reach the report.
+ *
+ * A name is server-controlled and a hostile server honours neither the spec's `A-Za-z0-9_-.`
+ * charset nor any length. `Rendered` guarantees it cannot carry a newline or an ANSI escape; this
+ * additionally stops it from being long enough to push our own words off the line it shares.
+ */
+export const MAX_SUBJECT_CHARS = 60;
 
 /**
  * **Reading order, and nothing else.**
@@ -236,20 +245,24 @@ const UNRANKED = 10_000;
  */
 export interface Measurement {
   readonly id: string;
-  readonly label: string;
+  readonly label: Rendered;
   readonly value: number;
-  readonly unit: string;
+  readonly unit: Rendered;
   /** The benign range this was compared against, and where that range came from. */
-  readonly reference?: string;
+  readonly reference?: Rendered;
   readonly outsideReference: boolean;
 }
 
 /** Something the assessment could not look at, and what would let it. */
 export interface NotChecked {
-  readonly what: string;
-  readonly why: string;
+  /**
+   * All three are `Rendered`. `why` in particular can carry `ProvenanceReport.notCheckedReason`,
+   * which is a registry-supplied string, and this field prints straight onto the sheet.
+   */
+  readonly what: Rendered;
+  readonly why: Rendered;
   /** The flag or option that would enable it, when one exists. */
-  readonly toEnable?: string;
+  readonly toEnable?: Rendered;
 }
 
 /**
@@ -265,7 +278,7 @@ export interface Truncation {
   /** Whole signals not shown. */
   readonly droppedSignals: number;
   /** Their rule ids, always listed in full — the ids are ours, short, and not attacker-controlled. */
-  readonly droppedRules: readonly string[];
+  readonly droppedRules: readonly Rendered[];
   /** Text units that were never scanned because the work budget ran out. */
   readonly unscannedTextUnits: number;
 }
@@ -301,13 +314,17 @@ export interface PinRiskAssessment {
  * Printed at the end of every report, verbatim, and asserted by
  * `test/unit/assess.test.ts`. It is the sentence that keeps the rest of the report honest.
  */
-export const PIN_ASSESSMENT_CAVEAT =
+export const PIN_ASSESSMENT_CAVEAT: Rendered = renderText(
   "None of this establishes that the server is safe. A server can be signed, attested, " +
   "unicode-clean and structurally unremarkable and still be poisoned: postmark-mcp was published " +
   "by its legitimate maintainer through its legitimate pipeline to ~300 organisations, and every " +
   "automated check listed above would have returned nothing on it. What toolwall guarantees after " +
   "you approve this is that the definition cannot change without you being told. What it is asking " +
-  "you to decide is whether the definition you are looking at is one you want.";
+  "you to decide is whether the definition you are looking at is one you want.",
+  // Long enough to need an explicit bound: the default clip is 300 and this is the one piece of
+  // text on the page that must never be shortened.
+  2_000,
+);
 
 // ---------------------------------------------------------------------------
 // Input
@@ -411,10 +428,16 @@ function sentences(text: string): string[] {
     .filter((s) => s.length > 0);
 }
 
-/** Collapse whitespace and clip, for quoting untrusted text into a report. */
-function excerpt(text: string, limit = 160): string {
-  const flat = text.replace(/\s+/gu, " ").trim();
-  return flat.length <= limit ? flat : `${flat.slice(0, limit - 1)}…`;
+/**
+ * Quote untrusted text into a report.
+ *
+ * Delegates to {@link renderText}, so this is a sanitizing clip and not merely a clip. The previous
+ * implementation collapsed `\s+` and stopped there, which left ESC, NUL and box-drawing characters
+ * intact in every quoted tool description — the same class of hole as the raw tool name in a
+ * headline, one field along. The return type is what stops it coming back.
+ */
+function excerpt(text: unknown, limit = 160): Rendered {
+  return renderText(text, limit);
 }
 
 // ---------------------------------------------------------------------------
@@ -544,13 +567,13 @@ interface Occurrence {
   readonly id: string;
   readonly lane: AssessmentLane;
   /** Headline when this rule fired exactly once. */
-  readonly headline: string;
+  readonly headline: Rendered;
   /** Headline when it fired more than once. Given the count, so it can state it. */
-  readonly groupHeadline?: (occurrences: number) => string;
-  readonly detail: string;
-  readonly locus: string;
-  readonly subject?: string;
-  readonly confidence: string;
+  readonly groupHeadline?: (occurrences: number) => Rendered;
+  readonly detail: Rendered;
+  readonly locus: Rendered;
+  readonly subject?: Rendered;
+  readonly confidence: Rendered;
 }
 
 /**
@@ -569,7 +592,7 @@ class SignalCollector {
     {
       readonly first: Occurrence;
       occurrences: number;
-      readonly subjects: string[];
+      readonly subjects: Rendered[];
       readonly examples: SignalExample[];
       /** Distinct subjects seen, so `occurrences` is not inflated by the same tool twice. */
       readonly seen: Set<string>;
@@ -592,8 +615,8 @@ class SignalCollector {
         subjects: occurrence.subject === undefined ? [] : [excerpt(occurrence.subject, 60)],
         examples: [
           {
-            locus: occurrence.locus,
-            detail: occurrence.detail,
+            locus: renderText(occurrence.locus),
+            detail: renderText(occurrence.detail),
             ...(occurrence.subject === undefined ? {} : { subject: occurrence.subject }),
           },
         ],
@@ -609,8 +632,8 @@ class SignalCollector {
     }
     if (existing.examples.length < MAX_EXAMPLES_PER_SIGNAL) {
       existing.examples.push({
-        locus: occurrence.locus,
-        detail: occurrence.detail,
+        locus: renderText(occurrence.locus),
+        detail: renderText(occurrence.detail),
         ...(occurrence.subject === undefined ? {} : { subject: occurrence.subject }),
       });
     }
@@ -696,13 +719,14 @@ export function assessPinCandidate(
       draft.signals.record({
         id: "toolwall/assess-unreadable-tool",
         lane: "deterministic",
-        headline: `tool entry ${i} is not an object, so nothing about it could be read`,
-        groupHeadline: (n) => `${n} tool entries are not objects, so nothing about them could be read`,
-        detail: `entry ${i} is ${tool === null ? "null" : typeof tool}`,
-        locus: path,
+        headline: rendered`tool entry ${i} is not an object, so nothing about it could be read`,
+        groupHeadline: (n) =>
+rendered`${n} tool entries are not objects, so nothing about them could be read`,
+        detail: rendered`entry ${i} is ${tool === null ? "null" : typeof tool}`,
+        locus: renderText(path),
         confidence:
-          "Deterministic. A tool this proxy cannot read is also one it cannot pin, and `drift.ts` " +
-          "refuses the whole listing.",
+          renderText("Deterministic. A tool this proxy cannot read is also one it cannot pin, and `drift.ts` " +
+          "refuses the whole listing."),
       });
       continue;
     }
@@ -730,17 +754,17 @@ export function assessPinCandidate(
         draft.signals.record({
           id: "toolwall/assess-readonly-claim-contradicted",
           lane: "deterministic",
-          headline: `"${name}" declares readOnlyHint: true but its own name states a mutating operation`,
+          headline: rendered`"${name}" declares readOnlyHint: true but its own name states a mutating operation`,
           groupHeadline: (n) =>
-            `${n} tools declare readOnlyHint: true while their own names state a mutating operation`,
-          detail: `annotations.readOnlyHint = true on a tool named "${name}"`,
-          locus: `${path}/annotations/readOnlyHint`,
-          subject: name,
+rendered`${n} tools declare readOnlyHint: true while their own names state a mutating operation`,
+          detail: rendered`annotations.readOnlyHint = true on a tool named "${name}"`,
+          locus: rendered`${path}/annotations/readOnlyHint`,
+          subject: renderText(name, MAX_SUBJECT_CHARS),
           confidence:
-            "Deterministic: the claim and the name are both in the payload and they disagree. " +
+            renderText("Deterministic: the claim and the name are both in the payload and they disagree. " +
             "Annotations are server-supplied and the spec says clients must never make tool-use " +
             "decisions on them, so the value of this is that the server is describing itself " +
-            "inconsistently — not that the annotation was believed.",
+            "inconsistently — not that the annotation was believed."),
         });
       }
     }
@@ -752,16 +776,16 @@ export function assessPinCandidate(
         draft.signals.record({
           id: "toolwall/assess-narrow-name-broad-schema",
           lane: "structural",
-          headline: `"${name}" names a self-contained operation but declares ${broad.length === 1 ? "a parameter" : "parameters"} for ${broad.join(", ")}`,
+          headline: rendered`"${name}" names a self-contained operation but declares ${broad.length === 1 ? "a parameter" : "parameters"} for ${broad.join(", ")}`,
           groupHeadline: (n) =>
-            `${n} tools name a self-contained operation but declare filesystem, network or command parameters`,
-          detail: `parameters: ${broad.join(", ")}`,
-          locus: `${path}/inputSchema`,
-          subject: name,
+rendered`${n} tools name a self-contained operation but declare filesystem, network or command parameters`,
+          detail: rendered`parameters: ${broad.join(", ")}`,
+          locus: rendered`${path}/inputSchema`,
+          subject: renderText(name, MAX_SUBJECT_CHARS),
           confidence:
-            "Structural, and a capability question rather than a text one: a calculator that " +
+            renderText("Structural, and a capability question rather than a text one: a calculator that " +
             "declares a filesystem path has declared a capability its name does not account for. " +
-            "Legitimately hit by tools with terse generic names.",
+            "Legitimately hit by tools with terse generic names."),
         });
       }
     }
@@ -774,14 +798,15 @@ export function assessPinCandidate(
       draft.signals.record({
         id: "toolwall/assess-duplicate-tool-name",
         lane: "deterministic",
-        headline: `"${name}" is advertised ${indexes.length} times in one listing`,
-        groupHeadline: (n) => `${n} tool names are each advertised more than once in one listing`,
-        detail: `entries ${indexes.join(", ")}`,
-        locus: `/tools/${indexes[1]}`,
-        subject: name,
+        headline: rendered`"${name}" is advertised ${indexes.length} times in one listing`,
+        groupHeadline: (n) =>
+rendered`${n} tool names are each advertised more than once in one listing`,
+        detail: rendered`entries ${indexes.join(", ")}`,
+        locus: rendered`/tools/${indexes[1]}`,
+        subject: renderText(name, MAX_SUBJECT_CHARS),
         confidence:
-          "Deterministic. Which definition the client keeps is undefined, so which one you " +
-          "approved is undefined (T-04; Docker MCP Gateway GHSA-m5m2-mrxf-7j7q).",
+          renderText("Deterministic. Which definition the client keeps is undefined, so which one you " +
+          "approved is undefined (T-04; Docker MCP Gateway GHSA-m5m2-mrxf-7j7q)."),
       });
     }
   }
@@ -804,18 +829,17 @@ export function assessPinCandidate(
       id: "toolwall/assess-metadata-flooding",
       lane: "deterministic",
       headline:
-        `this listing repeats itself: ${duplicatedNames} tool names are duplicated across ` +
-        `${tools.length} entries`,
+        rendered`this listing repeats itself: ${duplicatedNames} tool names are duplicated across ${tools.length} entries`,
       detail:
-        "repetition on this scale is how a listing crowds other evidence off a report; the " +
-        "repetition is the finding, not the individual copies",
-      locus: "/tools",
+        renderText("repetition on this scale is how a listing crowds other evidence off a report; the " +
+        "repetition is the finding, not the individual copies"),
+      locus: renderText("/tools"),
       confidence:
-        "Deterministic, and a statement about this report as much as about the server. No real " +
+        renderText("Deterministic, and a statement about this report as much as about the server. No real " +
         "server in the captured corpus (11 servers, 100 tools) advertises a single duplicated " +
         "name. Signals are grouped per rule and ranked before any bound is applied, so the " +
         "repetition cannot displace anything — but a server that constructs a listing this shape " +
-        "was trying to, and that is worth knowing before you approve it.",
+        "was trying to, and that is worth knowing before you approve it."),
     });
   }
 
@@ -876,46 +900,44 @@ export function assessPinCandidate(
 
   if (unscannedTextUnits > 0) {
     draft.notChecked.push({
-      what: `${unscannedTextUnits} text fields in this listing`,
+      what: rendered`${unscannedTextUnits} text fields in this listing`,
       why:
-        `the structural detectors stop after ${MAX_SCANNED_SENTENCES} sentences so a hostile ` +
-        "listing cannot make this assessment expensive. Everything past that point was NOT read, " +
-        "and this line is here so that fact cannot be mistaken for a clean result.",
+        rendered`the structural detectors stop after ${MAX_SCANNED_SENTENCES} sentences so a hostile listing cannot make this assessment expensive. Everything past that point was NOT read, and this line is here so that fact cannot be mistaken for a clean result.`,
     });
   }
 
   // --- advisory lane ------------------------------------------------------
   if (candidate.atrFindings === undefined) {
     draft.notChecked.push({
-      what: "agent-threat-rules detection",
+      what: renderText("agent-threat-rules detection"),
       why:
-        "the advisory detector is opt-in and no scanner was supplied. Not checked is not the same " +
-        "thing as clean.",
-      toEnable: "assembleToolwall({ atr: { scanner: await AtrScanner.create() } })",
+        renderText("the advisory detector is opt-in and no scanner was supplied. Not checked is not the same " +
+        "thing as clean."),
+      toEnable: renderText("assembleToolwall({ atr: { scanner: await AtrScanner.create() } })"),
     });
   } else if (candidate.atrFindings.length > 0) {
     const ids = [...new Set(candidate.atrFindings.map((f) => f.ruleId))];
     draft.signals.record({
       id: "toolwall/assess-atr-advisory",
       lane: "advisory",
-      headline: `agent-threat-rules matched ${candidate.atrFindings.length} time${candidate.atrFindings.length === 1 ? "" : "s"} on this listing`,
-      detail: ids.slice(0, 8).join(", ") + (ids.length > 8 ? `, +${ids.length - 8} more` : ""),
-      locus: candidate.atrFindings[0]?.locus ?? "",
+      headline: rendered`agent-threat-rules matched ${candidate.atrFindings.length} time${candidate.atrFindings.length === 1 ? "" : "s"} on this listing`,
+      detail: renderText(ids.slice(0, 8).join(", ") + (ids.length > 8 ? `, +${ids.length - 8} more` : "")),
+      locus: renderText(candidate.atrFindings[0]?.locus ?? ""),
       confidence:
-        "Advisory. Measured on the `alert` lane at 5-of-8 catch against the published payloads " +
+        renderText("Advisory. Measured on the `alert` lane at 5-of-8 catch against the published payloads " +
         "and 6.5% false positives on the 31-case benign metadata corpus — both small corpora, " +
-        "neither an ecosystem rate. This is why it never blocks.",
+        "neither an ecosystem rate. This is why it never blocks."),
     });
   }
 
   // --- provenance lane ----------------------------------------------------
   if (candidate.provenance === undefined) {
     draft.notChecked.push({
-      what: "package provenance (T-09)",
+      what: renderText("package provenance (T-09)"),
       why:
-        "provenance is opt-in because it is the only part of toolwall that can make a network " +
-        "request, and the default path makes none.",
-      toEnable: "toolwall --verify-provenance",
+        renderText("provenance is opt-in because it is the only part of toolwall that can make a network " +
+        "request, and the default path makes none."),
+      toEnable: renderText("toolwall --verify-provenance"),
     });
   } else {
     provenanceSignals(candidate.provenance, draft);
@@ -923,18 +945,18 @@ export function assessPinCandidate(
 
   if (candidate.tools === undefined) {
     draft.notChecked.push({
-      what: "the tool listing",
-      why: "this assessment was run on a server descriptor, so only `instructions` was available.",
+      what: renderText("the tool listing"),
+      why: renderText("this assessment was run on a server descriptor, so only `instructions` was available."),
     });
   }
   if (candidate.instructions === undefined && candidate.tools !== undefined) {
     draft.notChecked.push({
-      what: "server `instructions`",
+      what: renderText("server `instructions`"),
       why:
-        "no server descriptor had been observed when this listing arrived. `instructions` is the " +
+        renderText("no server descriptor had been observed when this listing arrived. `instructions` is the " +
         "field the spec designs to be placed straight into the client's system prompt and it is " +
         "what Pillar's Deadbugz campaign mutates, so its absence from this report is a gap, not a " +
-        "pass.",
+        "pass."),
     });
   }
 
@@ -990,7 +1012,7 @@ export function assessPinCandidate(
         signals,
         truncated: {
           droppedSignals: dropped.length,
-          droppedRules: dropped.map((d) => d.id),
+          droppedRules: dropped.map((d) => renderText(d.id, 120)),
           unscannedTextUnits,
         },
       };
@@ -1014,7 +1036,8 @@ function runStructural(
   toolNames: ReadonlySet<string>,
   draft: Draft,
 ): void {
-  const subject = unit.toolName === undefined ? {} : { subject: unit.toolName };
+  const subject =
+    unit.toolName === undefined ? {} : { subject: renderText(unit.toolName, MAX_SUBJECT_CHARS) };
   const where = unit.decoded ? " (recovered from invisible tag-block characters)" : "";
 
   /*
@@ -1035,18 +1058,18 @@ function runStructural(
     draft.signals.record({
       id: "toolwall/assess-concealment-directive",
       lane: "structural",
-      headline: `metadata tells the model to keep something from the person using it${where}`,
+      headline: rendered`metadata tells the model to keep something from the person using it${where}`,
       groupHeadline: (n) =>
-        `${n} tools carry metadata telling the model to keep something from the person using it`,
+rendered`${n} tools carry metadata telling the model to keep something from the person using it`,
       detail: excerpt(sentence),
-      locus: unit.path,
+      locus: renderText(unit.path),
       ...subject,
       confidence:
-        "Structural, and the most consistent device in the published corpus (5 of 8). A tool may " +
+        renderText("Structural, and the most consistent device in the published corpus (5 of 8). A tool may " +
         "legitimately tell a model what not to do; an instruction not to SAY what it did serves " +
         "the model's operator, not its user. Bypassable by anyone who paraphrases around the " +
         "verb list, and blind to 'do not echo … to the user', which is excluded because a real " +
-        "Vault secret-reader ships it.",
+        "Vault secret-reader ships it."),
     });
   }
 
@@ -1065,15 +1088,16 @@ function runStructural(
     draft.signals.record({
       id: "toolwall/assess-credential-location-directive",
       lane: "structural",
-      headline: `metadata instructs the model to read a credential store${where}`,
-      groupHeadline: (n) => `${n} tools carry metadata instructing the model to read a credential store`,
+      headline: rendered`metadata instructs the model to read a credential store${where}`,
+      groupHeadline: (n) =>
+rendered`${n} tools carry metadata instructing the model to read a credential store`,
       detail: excerpt(sentence),
-      locus: unit.path,
+      locus: renderText(unit.path),
       ...subject,
       confidence:
-        "Structural. Keyed on a retrieval verb next to a credential-store path literal in one " +
+        renderText("Structural. Keyed on a retrieval verb next to a credential-store path literal in one " +
         "sentence, which is what separates it from a secrets scanner whose subject matter is the " +
-        "same words. A server that describes the path indirectly is not caught.",
+        "same words. A server that describes the path indirectly is not caught."),
     });
   }
 
@@ -1091,16 +1115,16 @@ function runStructural(
       draft.signals.record({
         id: "toolwall/assess-hardcoded-recipient",
         lane: "structural",
-        headline: `metadata names a fixed destination for data the caller did not choose${where}`,
+        headline: rendered`metadata names a fixed destination for data the caller did not choose${where}`,
       groupHeadline: (n) =>
-          `${n} tools name a fixed destination for data the caller did not choose`,
+rendered`${n} tools name a fixed destination for data the caller did not choose`,
         detail: excerpt(sentence),
-        locus: unit.path,
+        locus: renderText(unit.path),
         ...subject,
         confidence:
-          "Structural. A literal address or number inside a transmission instruction, with " +
+          renderText("Structural. A literal address or number inside a transmission instruction, with " +
           "RFC 2606 documentation names excluded. A real notification tool that hardcodes its own " +
-          "support address will land here.",
+          "support address will land here."),
       });
     }
   }
@@ -1121,16 +1145,16 @@ function runStructural(
     draft.signals.record({
       id: "toolwall/assess-cross-server-tool-reference",
       lane: "structural",
-      headline: `metadata gives instructions about "${referenced}", which this server does not advertise${where}`,
+      headline: rendered`metadata gives instructions about "${referenced}", which this server does not advertise${where}`,
       groupHeadline: (n) =>
-        `${n} tools give instructions about tools this server does not advertise`,
+rendered`${n} tools give instructions about tools this server does not advertise`,
       detail: excerpt(sentence),
-      locus: unit.path,
+      locus: renderText(unit.path),
       ...subject,
       confidence:
-        "Structural. Cross-server shadowing (T-04) works by one server's description redefining " +
+        renderText("Structural. Cross-server shadowing (T-04) works by one server's description redefining " +
         "another's tool, so a directive about a tool that is not in this listing is worth a look. " +
-        "A server that documents a companion server it genuinely pairs with lands here too.",
+        "A server that documents a companion server it genuinely pairs with lands here too."),
     });
     break;
   }
@@ -1149,18 +1173,18 @@ function recordHazard(hazards: readonly SurfaceHazard[], draft: Draft): void {
   draft.signals.record({
     id: "toolwall/assess-invisible-characters",
     lane: "deterministic",
-    headline: `metadata contains characters that do not render: ${classes.join(", ")}`,
+    headline: rendered`metadata contains characters that do not render: ${classes.join(", ")}`,
     detail:
-      decoded === undefined
+      renderText(decoded === undefined
         ? `${hazards.length} run${hazards.length === 1 ? "" : "s"}, first at ${hazards[0]?.path ?? "?"}`
-        : `decoded payload: ${excerpt(decoded.decoded ?? "")}`,
-    locus: (decoded ?? hazards[0])?.path ?? "",
+        : `decoded payload: ${excerpt(decoded.decoded ?? "")}`),
+    locus: renderText((decoded ?? hazards[0])?.path ?? ""),
     confidence:
-      "Deterministic, and the one class of first-sighting attack a character-level control catches " +
+      renderText("Deterministic, and the one class of first-sighting attack a character-level control catches " +
       "with certainty. Measured 0.0% false positives across 90 benign metadata strings including " +
       "emoji ZWJ sequences, Persian ZWNJ and Devanagari. `UnicodeHygieneGuard` already rejects " +
       "this listing on its own — it is repeated here because it is the strongest evidence on the " +
-      "sheet.",
+      "sheet."),
   });
 }
 
@@ -1185,51 +1209,50 @@ function provenanceSignals(report: ProvenanceReport, draft: Draft): void {
   const a = report.attestation;
   if (report.verificationDepth === "none" || a === undefined) {
     draft.notChecked.push({
-      what: "package attestation",
+      what: renderText("package attestation"),
       why:
-        report.notCheckedReason ??
-        `the registry half did not run for this package (${report.resolution.kind}).`,
-      toEnable: "toolwall --verify-provenance",
+        renderText(report.notCheckedReason ??
+        `the registry half did not run for this package (${report.resolution.kind}).`),
+      toEnable: renderText("toolwall --verify-provenance"),
     });
   } else {
     if (!a.attestationPresent) {
       draft.signals.record({
         id: "toolwall/assess-no-attestation",
         lane: "provenance",
-        headline: "the registry has no build attestation for this package version",
+        headline: renderText("the registry has no build attestation for this package version"),
         detail:
-          `registry signature ${a.registrySignaturePresent ? "present" : "absent"}; ` +
-          `trusted publisher ${a.trustedPublisher ? "yes" : "no"}`,
-        locus: "",
+          rendered`registry signature ${a.registrySignaturePresent ? "present" : "absent"}; trusted publisher ${a.trustedPublisher ? "yes" : "no"}`,
+        locus: renderText(""),
         confidence:
-          "A hygiene signal about the publisher, not an integrity control: a hostile registry can " +
+          renderText("A hygiene signal about the publisher, not an integrity control: a hostile registry can " +
           "lie about the field. `@modelcontextprotocol/sdk` and the official servers ship " +
           "attestations; mcp-remote — the CVSS 9.6 RCE package — does not. Absence is common and " +
-          "is not by itself evidence of anything.",
+          "is not by itself evidence of anything."),
       });
     }
     if (a.repositoryMismatch === true) {
       draft.signals.record({
         id: "toolwall/assess-repository-mismatch",
         lane: "provenance",
-        headline: "the package manifest and the build attestation name different source repositories",
-        detail: `manifest ${a.declaredRepository ?? "?"} vs attested ${a.attestedRepository ?? "?"}`,
-        locus: "",
+        headline: renderText("the package manifest and the build attestation name different source repositories"),
+        detail: rendered`manifest ${a.declaredRepository ?? "?"} vs attested ${a.attestedRepository ?? "?"}`,
+        locus: renderText(""),
         confidence:
-          "Deterministic given both documents, and the strongest single provenance signal here: " +
-          "the artifact was not built from the repository the package claims.",
+          renderText("Deterministic given both documents, and the strongest single provenance signal here: " +
+          "the artifact was not built from the repository the package claims."),
       });
     }
     if (a.subjectDigestMatchesDist === false) {
       draft.signals.record({
         id: "toolwall/assess-attestation-subject-mismatch",
         lane: "provenance",
-        headline: "the attestation describes a different artifact from the one this registry serves",
-        detail: "in-toto subject digest does not equal dist.integrity",
-        locus: "",
+        headline: renderText("the attestation describes a different artifact from the one this registry serves"),
+        detail: renderText("in-toto subject digest does not equal dist.integrity"),
+        locus: renderText(""),
         confidence:
-          "Deterministic given both documents. Catches an attestation stapled to the wrong " +
-          "artifact; does not survive a registry that controls both fields.",
+          renderText("Deterministic given both documents. Catches an attestation stapled to the wrong " +
+          "artifact; does not survive a registry that controls both fields."),
       });
     }
   }
@@ -1239,13 +1262,13 @@ function provenanceSignals(report: ProvenanceReport, draft: Draft): void {
     draft.signals.record({
       id: "toolwall/assess-file-hash-mismatch",
       lane: "provenance",
-      headline: "the local artifact does not match the fileSha256 declared in server.json",
-      detail: `declared ${fh.declared.slice(0, 16)}…, computed ${(fh.computed ?? "?").slice(0, 16)}…`,
-      locus: "",
+      headline: renderText("the local artifact does not match the fileSha256 declared in server.json"),
+      detail: rendered`declared ${fh.declared.slice(0, 16)}…, computed ${(fh.computed ?? "?").slice(0, 16)}…`,
+      locus: renderText(""),
       confidence:
-        "The one check here that earns the word verified: it recomputes a hash from bytes on your " +
+        renderText("The one check here that earns the word verified: it recomputes a hash from bytes on your " +
         "disk. The registry does not validate this field, so a mismatch is a publishing mistake " +
-        "more often than an attack — but it is always worth resolving before you approve.",
+        "more often than an attack — but it is always worth resolving before you approve."),
     });
   }
 }
@@ -1267,25 +1290,41 @@ function provenanceSignals(report: ProvenanceReport, draft: Draft): void {
  * own header says length is not a signal, and it is right.
  */
 const REFERENCE = {
-  toolCount: "1–40 across the observed benign servers",
-  descriptionChars: "up to ~2,000; real servers ship long descriptions and length is not a signal",
-  totalTextChars: "no bound — reported for context only",
-  instructionsChars: "0–2,000 across the observed benign servers",
-  directiveShare: "benign servers run roughly 15–45%; imperative prose is normal and not a signal",
-  unannotated: "most real servers annotate nothing at all",
+  toolCount: renderText("1–40 across the observed benign servers"),
+  descriptionChars: renderText("up to ~2,000; real servers ship long descriptions and length is not a signal"),
+  totalTextChars: renderText("no bound — reported for context only"),
+  instructionsChars: renderText("0–2,000 across the observed benign servers"),
+  directiveShare: renderText("benign servers run roughly 15–45%; imperative prose is normal and not a signal"),
+  unannotated: renderText("most real servers annotate nothing at all"),
 } as const;
 
 const REFERENCE_MAX = { toolCount: 40, instructionsChars: 2_000 } as const;
 
+/**
+ * Build one measurement.
+ *
+ * This is a **sanitizer boundary**, like {@link renderText} itself: it takes plain strings and
+ * returns a `Measurement` whose text fields are `Rendered`. That keeps eight call sites readable
+ * while preserving the property that matters — `renderPinAssessment` only ever handles `Rendered`,
+ * and there is exactly one place where a measurement's text becomes renderable. Every label here is
+ * a source literal today; this is what keeps that from being load-bearing.
+ */
 function m(
   id: string,
   label: string,
   value: number,
   unit: string,
-  reference: string | undefined,
+  reference: Rendered | undefined,
   outsideReference: boolean,
 ): Measurement {
-  return { id, label, value, unit, ...(reference === undefined ? {} : { reference }), outsideReference };
+  return {
+    id,
+    label: renderText(label),
+    value,
+    unit: renderText(unit),
+    ...(reference === undefined ? {} : { reference }),
+    outsideReference,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1336,7 +1375,10 @@ function renderHeadline(a: Omit<PinRiskAssessment, "rendered" | "headline">): st
  */
 export function renderPinAssessment(a: PinRiskAssessment): string {
   const lines: string[] = [];
-  lines.push(`PIN-TIME ASSESSMENT · ${a.serverId}`);
+  // `serverId` is derived from the operator's own launch config rather than from the wire, but
+  // it is the one field on this page that is not already `Rendered`, and "not from the wire" is
+  // exactly the reasoning that failed in Rounds 2 and 3.
+  lines.push(`PIN-TIME ASSESSMENT · ${renderText(a.serverId, 120)}`);
   lines.push(
     `${a.toolCount} tool${a.toolCount === 1 ? "" : "s"} · assessed ${a.assessedAt} · offline, no network, nothing sent anywhere`,
   );
@@ -1353,8 +1395,7 @@ export function renderPinAssessment(a: PinRiskAssessment): string {
     lines.push("!! THIS REPORT IS INCOMPLETE");
     if (a.truncated.droppedSignals > 0) {
       lines.push(
-        `   ${a.truncated.droppedSignals} signal${a.truncated.droppedSignals === 1 ? " was" : "s were"} not shown: ` +
-          a.truncated.droppedRules.join(", "),
+        rendered`   ${a.truncated.droppedSignals} signal${a.truncated.droppedSignals === 1 ? " was" : "s were"} not shown: ${a.truncated.droppedRules.join(", ")}`,
       );
     }
     if (a.truncated.unscannedTextUnits > 0) {
@@ -1362,7 +1403,9 @@ export function renderPinAssessment(a: PinRiskAssessment): string {
         `   ${a.truncated.unscannedTextUnits} text fields were never scanned — the listing exceeded the work budget.`,
       );
     }
-    lines.push(`   ${wrap("Do not read the sections below as the whole picture. Raise the bound and re-run, or review the definition by hand.", 3)}`);
+    lines.push(
+      `   ${wrap(renderText("Do not read the sections below as the whole picture. Raise the bound and re-run, or review the definition by hand."), 3)}`,
+    );
     lines.push("");
   }
 
@@ -1383,7 +1426,7 @@ export function renderPinAssessment(a: PinRiskAssessment): string {
       // them where to look.
       if (s.subjects.length > 0) {
         const more = s.omittedSubjects > 0 ? ` and ${s.omittedSubjects} more` : "";
-        lines.push(`      ${wrap(`tools: ${s.subjects.join(", ")}${more}`, 6)}`);
+        lines.push(`      ${wrap(rendered`tools: ${s.subjects.join(", ")}${more}`, 6)}`);
       } else if (s.occurrences > 1) {
         lines.push(`      ${s.occurrences} occurrences`);
       }
@@ -1420,7 +1463,15 @@ export function renderPinAssessment(a: PinRiskAssessment): string {
   return lines.join("\n");
 }
 
-function wrap(text: string, indent: number): string {
+/**
+ * Hard-wrap one paragraph for a terminal.
+ *
+ * Takes `Rendered`, not `string`. This is the enforcement point that makes the brand worth having:
+ * the renderer is the surface, so if the only text-shaping function it has refuses unsanitized
+ * input, the fourth instance of this bug class is a type error at the call site rather than a line
+ * an attacker writes into someone's approval screen.
+ */
+function wrap(text: Rendered, indent: number): string {
   const width = 92 - indent;
   const pad = " ".repeat(indent);
   const words = text.split(/\s+/u);
@@ -1461,8 +1512,8 @@ export function assessmentFinding(a: PinRiskAssessment, locus: string): Finding 
       signals: a.signals.map((s) => ({
         id: s.id,
         lane: s.lane,
-        headline: s.headline,
-        locus: s.locus,
+        headline: renderText(s.headline),
+        locus: renderText(s.locus),
         occurrences: s.occurrences,
       })),
       measurements: a.measurements,

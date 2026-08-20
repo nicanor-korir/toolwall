@@ -88,6 +88,17 @@ const MANIFEST: Record<string, Classification> = {
         status: 'support',
         reason: 'the ONE server-identity derivation. `spawn.ts` and `manifest.ts` both adapt to it — that single source is itself the fix for a Week-1 defect where two derivations disagreed.'
     },
+    'audit/render.ts': {
+        status: 'support',
+        reason:
+            'the `Rendered` branded type and its two constructors. It is what makes "a string that has touched ' +
+            'server input cannot reach a human-rendered surface without passing a sanitizer" a compiler rule ' +
+            'rather than a convention that has now failed three times (Round 2 `Finding.locus` in the tty ' +
+            'dialog, Round 3 raw tool names in the assessment sheet). Delegates the actual flattening to ' +
+            '`sanitizeRenderedText` in types/protocol.ts rather than growing a second opinion about ANSI ' +
+            'escapes. Reachable via guards/metadata/assess.ts; it should eventually move next to the ' +
+            'sanitizer in protocol.ts so the confirm.ts and proxy.ts sinks get the same guarantee.'
+    },
     'audit/provenance.ts': {
         status: 'opt-in',
         reason: 'T-09. It is the only code in the product that can make a network request, so it is off unless an operator names the flag, and offline unless they name --verify-provenance specifically.',

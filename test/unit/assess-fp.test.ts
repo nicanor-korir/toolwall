@@ -184,7 +184,7 @@ describe("false positives · the held-out corpus (test/fixtures/benign/)", () =>
     const byServer = new Map<string, unknown[]>();
     const seen = new Set<string>();
     for (const c of all) {
-      const key = `${c.serverId} ${c.tool.name}`;
+      const key = `${c.serverId}\u0000${c.tool.name}`;
       if (seen.has(key)) continue;
       seen.add(key);
       byServer.set(c.serverId, [...(byServer.get(c.serverId) ?? []), c.tool]);

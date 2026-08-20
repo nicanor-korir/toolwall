@@ -263,6 +263,29 @@ The operator got a full-looking page of junk. Three changes close it:
   `assess-metadata-flooding`, ranked second, immediately after a hidden payload. No server in the captured
   corpus advertises a single duplicated name, so the attacker's own payload becomes the top line.
 
+**A server cannot write its own lines onto the sheet.** Every text field on the report is a branded
+`Rendered` type (`src/audit/render.ts`), and the only way to obtain one is through a sanitizer — either
+`renderText(value)` or the `` rendered`...` `` tagged template, which sanitizes every interpolation
+automatically while leaving our own literal words alone. `Rendered` is assignable to `string`; `string` is
+not assignable to `Rendered`, so a field that a server's text can reach cannot be filled with a plain
+template literal. The report's own line-wrapper accepts `Rendered` and nothing else.
+
+This is deliberately a type and not another round of call-site fixes, because the same class of bug has
+now surfaced three times and twice been patched where it was found:
+
+| round | field | surface |
+|---|---|---|
+| 2 | `Finding.locus` | the `/dev/tty` confirmation dialog — a server drew its own `│ rule : … [info]` rows into the approval box |
+| 3 | tool `name`, in three headlines and in `SignalExample.subject` | the pin-time sheet — same forged-row attack, one field along from a clip that *was* applied |
+| 3 | quoted tool descriptions | ANSI escapes: the old clip collapsed `\s+`, and `ESC` is not `\s` |
+
+Both earlier times the reasoning was *"these fields are ours"*, and both times a server-controlled
+substring was sitting inside them. The fourth instance is now a compile error rather than a red-team
+finding. A whole-report assertion that no control, C1 or box-drawing character survives runs over all
+three benign corpora and over deliberately hostile listings, as the backstop behind the type. The
+flattening itself is still `sanitizeRenderedText` from `src/types/protocol.ts` — one opinion about what is
+dangerous in a terminal, not two.
+
 **Truncation is never silent.** If a bound ever does bite, `truncated` says how many signals were dropped
 and names their rules, the headline says `N signals NOT SHOWN`, and the report opens — above the signals,
 not below them — with `!! THIS REPORT IS INCOMPLETE`. The same applies to the work budget: if the

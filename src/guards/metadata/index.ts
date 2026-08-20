@@ -128,6 +128,15 @@ export {
   assessmentFinding,
   renderPinAssessment,
 } from "./assess.js";
+/**
+ * `Rendered` is part of the assessment's public shape — every text field on a `RiskSignal` is one —
+ * so it is re-exported here for embedders. It lives in `src/audit/render.ts`; see that file for why
+ * the brand exists and why its long-term home is beside `sanitizeRenderedText` in
+ * `src/types/protocol.ts`.
+ */
+export { FORBIDDEN_RENDER_CHARS, renderText, rendered } from "../../audit/render.js";
+export type { Rendered } from "../../audit/render.js";
+
 export type {
   AssessOptions,
   AssessmentLane,
@@ -139,3 +148,4 @@ export type {
   SignalExample,
   Truncation,
 } from "./assess.js";
+export { MAX_SUBJECT_CHARS } from "./assess.js";
