@@ -69,7 +69,8 @@ export type CanonicalizationErrorCode =
   | "cycle"
   | "max-depth"
   | "max-nodes"
-  | "key-collision";
+  | "key-collision"
+  | "unsafe-key";
 
 /** Thrown instead of producing a guess. On the enforcement path this must fail closed. */
 export class CanonicalizationError extends Error {
@@ -99,6 +100,109 @@ export interface CanonicalizeOptions {
 
 const DEFAULT_MAX_DEPTH = 64;
 const DEFAULT_MAX_NODES = 50_000;
+
+/**
+ * Object keys this canonicalizer refuses: any key containing a backslash.
+ *
+ * ## Why, and it is not squeamishness about odd characters
+ *
+ * The canonical form is computed from a value that some **other** code parsed off the wire, and on
+ * at least one shipping JavaScript engine that parse is not faithful. Reproduced on Node v25.2.1:
+ *
+ * ```js
+ * JSON.parse(String.raw`{"a":1,"\\":2}`);   // interns a key that is one backslash
+ * JSON.parse(String.raw`{"a":1,"\n":2}`);    // -> keys are "a" and "\", NOT "a" and U+000A
+ * ```
+ *
+ * Once an object of a given shape whose key is a lone backslash has been parsed, a later object of
+ * the same shape whose key is an **escape sequence** comes back as the raw first character of that
+ * escape — a backslash — instead of the character the escape denotes. It affects every escape
+ * (`\n`, `\t`, `\r`, `\b`, `\f`, `\uXXXX`, `\"`, `\/`), is not a JIT artifact (it reproduces
+ * under `--jitless`), and needs no toolwall code to demonstrate.
+ *
+ * Both halves of the pinning invariant break under it:
+ *
+ *   - **Same bytes, different hash.** What a document parses to depends on what the process parsed
+ *     before it, so one listing can hash two ways across two sessions. That is a false rug-pull
+ *     alarm against a server that did nothing, which `docs/ARCHITECTURE.md` names as the failure
+ *     that gets the product uninstalled.
+ *   - **Different bytes, same hash — the serious one.** `{"a":{},"\\":{}}` and `{"a":{},"\t":{}}`
+ *     are different documents that produce the **same pin**, verified in
+ *     `test/unit/canonicalize.platform.test.ts`. A server pinned with the first can later ship the
+ *     second and the pinning engine sees nothing. That is a rug pull walking through the one
+ *     control this product claims is deterministic.
+ *
+ * ## Why refusing backslash keys is exactly the right width
+ *
+ * The corruption strikes only a key that is **entirely one escape sequence**, and its result is
+ * always exactly one character: the backslash that began the escape. (`"a\\nb"` and `"\\n\\t"` decode
+ * correctly — measured; it is the whole-key-is-one-escape case that breaks.) So:
+ *
+ *   - **Every corrupted key contains a backslash**, therefore refusing backslash keys means a
+ *     corrupted document can never acquire a pin, never collide with another document's pin, and
+ *     never masquerade as drift. That is the soundness argument, and it is the whole of it.
+ *   - We cannot do better than refusal, because a mangled key is *indistinguishable* from a
+ *     legitimate backslash key — the mangled form IS a backslash key.
+ *   - We should not do more than this. Control characters in a key are a hygiene question, not an
+ *     identity one, and they already have an owner with a measured false-positive rate:
+ *     `UnicodeHygieneGuard` scans object keys and rejects the `control` class. Duplicating that
+ *     policy here would put a hygiene decision in the module whose only job is identity, and would
+ *     make unpinnable a listing the product deliberately documents as pinnable-under-TOFU
+ *     (`test/integration/response-guards-e2e.test.ts`).
+ *
+ * A key we refuse makes the tool unpinnable, and `drift.ts` treats unpinnable as not callable —
+ * fail-closed, the same posture as every other ambiguity in this file.
+ *
+ * The refusal is **unconditional**, not gated on a runtime probe, so that a pin means the same
+ * thing on every machine and cannot become valid or invalid because of an engine upgrade.
+ * {@link platformParsesKeyEscapesFaithfully} exists so the state of the running engine can still be
+ * reported, and so the test suite notices the day the bug is fixed.
+ *
+ * **Cost, measured:** zero. No key in `test/fixtures/metadata/benign-metadata.ts`, no key in
+ * `test/fixtures/benign/`, and no key across the 100 tools of the 11 captured real servers in
+ * `test/fixtures/metadata/real-servers.ts` contains a backslash. JSON Schema property names in the
+ * wild are identifiers.
+ */
+const UNSAFE_KEY = /\\/u;
+
+/** Human-readable code points, for an error message a person can act on. */
+function describeUnsafeKey(key: string): string {
+  return [...key]
+    .map((ch) => {
+      const cp = ch.codePointAt(0) as number;
+      return UNSAFE_KEY.test(ch)
+        ? `U+${cp.toString(16).toUpperCase().padStart(4, "0")}`
+        : ch;
+    })
+    .join("");
+}
+
+let platformProbe: boolean | undefined;
+
+/**
+ * Does this engine decode an escaped object key faithfully after it has seen a lone-backslash key?
+ *
+ * `true` on a correct engine. `false` on Node v25.2.1 and anything else carrying the same V8 bug.
+ * Memoised; the probe is two `JSON.parse` calls.
+ *
+ * Nothing in the canonicalizer branches on this — the refusal above is unconditional on purpose.
+ * It is exported so an operator report can say which engine they are on, and so
+ * `test/unit/canonicalize.platform.test.ts` fails loudly on the day the engine is fixed and this
+ * restriction can be revisited rather than carried forever out of habit.
+ */
+export function platformParsesKeyEscapesFaithfully(): boolean {
+  if (platformProbe !== undefined) return platformProbe;
+  try {
+    // Same shape, so the second parse reuses the first's cached transition. Order matters, and
+    // String.raw is used so the JSON text in this file reads exactly as it does on the wire.
+    JSON.parse(String.raw`{"a":1,"\\":2}`);
+    const keys = Object.keys(JSON.parse(String.raw`{"a":1,"\n":2}`));
+    platformProbe = keys[1] === "\n";
+  } catch {
+    platformProbe = false;
+  }
+  return platformProbe;
+}
 
 /** Fast path: NFC is the identity on pure ASCII, and most metadata is pure ASCII. */
 // eslint-disable-next-line no-control-regex
@@ -252,6 +356,20 @@ export function canonicalize(value: unknown, options: CanonicalizeOptions = {}):
           continue;
         }
         const key = normalize ? normalizeText(raw) : raw;
+        // See UNSAFE_KEY: a key carrying a control character or a backslash cannot be vouched for,
+        // because the engine that parsed it may have handed us a different key from the one on the
+        // wire — and the corrupted form is itself a backslash key, so it is undetectable after the
+        // fact. Refuse rather than pin something we cannot stand behind.
+        if (UNSAFE_KEY.test(key)) {
+          throw new CanonicalizationError(
+            "unsafe-key",
+            `${path}/${pointerSegment(key)}`,
+            `object key "${describeUnsafeKey(key)}" contains a backslash; a backslash key is ` +
+              "indistinguishable from what this engine produces when it mis-decodes an escaped key " +
+              "(see UNSAFE_KEY in canonicalize.ts for the reproducer), so it has no dependable " +
+              "canonical form and toolwall will not pin one",
+          );
+        }
         const previous = seen.get(key);
         if (previous !== undefined) {
           throw new CanonicalizationError(

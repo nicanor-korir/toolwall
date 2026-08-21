@@ -116,6 +116,32 @@ anything automated.
 - **Listings the proxy never sees.** Under `2026-07-28` a `ttlMs` on the listing entitles the client
   to cache it, so toolwall will not observe every fetch. Per-call verification against the pin is
   what covers that gap, and the TTL is recorded as an event so the assumption cannot creep back in.
+- **Definitions with a backslash in an object key — refused, not pinned.** A soundness rule, not a
+  style one. On Node v25.2.1 `JSON.parse` returns the wrong key once an object of the same shape
+  with a lone-backslash key has been parsed:
+
+  ```js
+  JSON.parse(String.raw`{"a":1,"\\":2}`);   // interns a key that is one backslash
+  JSON.parse(String.raw`{"a":1,"\n":2}`);    // -> keys "a" and "\\", NOT "a" and U+000A
+  ```
+
+  It affects **any** key written as an escape on the wire — including an ordinary letter sent as
+  `\u0062` — reproduces under `--jitless`, and needs no toolwall code to demonstrate. Both halves of
+  the pinning invariant break under it: identical bytes hash two ways depending on what the process
+  parsed earlier (a false rug-pull alarm), and — the serious direction — **two different wire
+  documents produce the same pin**, so a server pinned with one could later ship the other
+  unnoticed. Every corruption lands on exactly one shape, a lone-backslash key, so `canonicalize`
+  refuses that shape with `CanonicalizationError { code: "unsafe-key" }` and the pin guard turns
+  that into `toolwall/pin-uncanonicalizable` — blocked. On an affected engine the outcome is a loud
+  refusal naming the character, never a wrong pin and never a silent collision.
+
+  Control characters in keys are deliberately **not** refused here: that is a hygiene question,
+  `UnicodeHygieneGuard` already owns it with a measured false-positive rate, and identity is this
+  module's only job. Measured cost of the refusal: **0 of 11 captured real servers, 0 of 100 real
+  tools, 0 of 31 adversarial metadata cases, 0 of 24 held-out cases.** JSON Schema property names in
+  the wild are identifiers. `test/unit/canonicalize.platform.test.ts` carries the reproducer and is
+  written to fail the day the engine is fixed, so the restriction is revisited rather than carried
+  out of habit.
 
 ### False positives
 
