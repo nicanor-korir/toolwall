@@ -927,15 +927,63 @@ export type { Hazard, HazardClass, HazardDisposition, SurfaceHazard, UnicodeHygi
 export { ATR_GUARD_RESPONSE_METHODS, AtrAdvisoryGuard, AtrScanner, METADATA_RULE_CATEGORIES } from './guards/metadata/rules.js';
 export type { AtrAdvisoryGuardOptions, AtrLane, AtrMode, AtrScannerOptions } from './guards/metadata/rules.js';
 
+/**
+ * Pin-time risk assessment, and the brand that makes its text safe to print.
+ *
+ * `Rendered` is part of the public shape of an assessment — every text field on a `RiskSignal` is
+ * one — so an embedder that reads a `PinRiskAssessment` needs to be able to name the type. It is
+ * also how the confirmation dialog and `redactFindingForClient` state their own guarantee, which
+ * is why it lives in `src/types/protocol.ts` beside the sanitizers rather than in `src/audit/`.
+ * A `Rendered` can only be produced by `renderText`, `renderLocus` or the `rendered` tag, and all
+ * three delegate to the one implementation of "what is dangerous in a terminal".
+ */
+export {
+    FLOOD_DUPLICATE_NAMES,
+    MAX_EXAMPLES_PER_SIGNAL,
+    MAX_SCANNED_SENTENCES,
+    MAX_SUBJECTS_PER_SIGNAL,
+    MAX_SUBJECT_CHARS,
+    PIN_ASSESSMENT_CAVEAT,
+    SIGNAL_READING_ORDER,
+    assessPinCandidate,
+    assessmentFinding,
+    renderPinAssessment
+} from './guards/metadata/assess.js';
+export type {
+    AssessOptions,
+    AssessmentLane,
+    Measurement,
+    NotChecked,
+    PinCandidate,
+    PinRiskAssessment,
+    RiskSignal,
+    SignalExample,
+    Truncation
+} from './guards/metadata/assess.js';
+export {
+    DEFAULT_RENDER_LENGTH,
+    FORBIDDEN_RENDER_CHARS,
+    renderLines,
+    renderLocus,
+    renderText,
+    rendered,
+    renderedWithin,
+    sanitizeLocus,
+    sanitizeRenderedText
+} from './types/protocol.js';
+export type { Rendered } from './types/protocol.js';
+
 export { SchemaGuard, CapabilityGuard } from './guards/runtime/index.js';
 export { ResultGuard, RESULT_METHODS, SERVER_REQUEST_METHODS } from './guards/runtime/result-guard.js';
 export type { ResultGuardOptions } from './guards/runtime/result-guard.js';
-export { BudgetedConfirmationProvider, ttyChannel, renderPrompt } from './guards/runtime/confirm.js';
+export { BudgetedConfirmationProvider, MAX_DIALOG_FINDINGS, composePrompt, promptRow, ttyChannel, renderPrompt } from './guards/runtime/confirm.js';
 export type {
     BudgetedConfirmationOptions,
     ConfirmationChannel,
     ConfirmationOutcome,
-    ConfirmationRecord
+    ConfirmationRecord,
+    RenderedPromptHeader,
+    RenderedPromptRow
 } from './guards/runtime/confirm.js';
 export { parsePolicy, defaultPolicy } from './policy/parse.js';
 export type { ResolvedPolicy, ParseResult, PolicyError } from './policy/parse.js';

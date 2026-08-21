@@ -389,6 +389,25 @@ Three things worth noticing:
 
 A copy of this shape lives at `toolwall-policy.example.json` in the repo root.
 
+### The server key has to match the server id
+
+`servers` is keyed on the **server id**, and by default that id is *derived*, not chosen:
+`srv_<32 hex>` over the command, its arguments, the cwd and the NAMES of the inherited environment
+variables. A readable key like `"filesystem"` — which is what the example uses, because
+`srv_9f3c…` is unreadable in a file you have to maintain — therefore matches nothing unless you say
+so:
+
+```bash
+npx toolwall --server "npx -y @modelcontextprotocol/server-filesystem ~/projects" \
+             --policy ./toolwall-policy.json --server-id filesystem
+```
+
+A `servers` block whose key matches nothing is **inert**: capability falls back to the tier
+defaults and any egress allowlist in it is not enforced. toolwall says so loudly on stderr at
+startup and prints the id it derived, so you can either pass `--server-id` or paste the derived id
+into the file. It is a warning rather than an error because one policy file legitimately describes
+several servers and only one of them is connected in a given session.
+
 ---
 
 ## Strictness tiers

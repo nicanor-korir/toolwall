@@ -8,7 +8,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { FORBIDDEN_RENDER_CHARS } from "../../src/audit/render.js";
+import { FORBIDDEN_RENDER_CHARS } from "../../src/types/protocol.js";
 import { BENIGN_METADATA_CORPUS } from "../fixtures/metadata/benign-metadata.js";
 import { REAL_SERVER_CAPTURES } from "../fixtures/metadata/real-servers.js";
 import {

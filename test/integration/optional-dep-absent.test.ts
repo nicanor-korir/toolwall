@@ -163,9 +163,17 @@ describe('toolwall without the optional agent-threat-rules package', () => {
         const tools = (listed?.['result'] as { tools?: Array<{ name: string }> } | undefined)?.tools ?? [];
         expect(tools.map(t => t.name)).toContain('echo');
 
-        // Nothing about the missing package may reach the user when they did not ask for it.
-        expect(run.stderr).not.toContain('agent-threat-rules');
+        // Nothing about the missing package may reach the user as a FAILURE when they did not ask
+        // for it: no resolution error, no stack, no claim that the advisory guard is running.
         expect(run.stderr).not.toContain('ERR_MODULE_NOT_FOUND');
+        expect(run.stderr).not.toContain('Cannot find');
+        expect(run.stderr).not.toContain('metadata.atr');
+        expect(run.stderr).not.toContain('advisory rules ON');
+        // It IS named once, in the pin sheet's "Not checked" list, which now reaches stderr in the
+        // default path. That is the sheet's discipline — silence must not read as a pass — and it
+        // is the opposite of the failure this test exists to catch: it says the detector was not
+        // run, next to the line telling you how to run it.
+        expect(run.stderr).toContain('agent-threat-rules detection: the advisory detector is opt-in');
     });
 
     it('still BLOCKS a rug pull without the advisory package — the security core is independent', async () => {
@@ -186,7 +194,9 @@ describe('toolwall without the optional agent-threat-rules package', () => {
         );
         // Same server, same definitions: the pinned listing re-verifies and passes.
         expect(second.messages.find(m => m['id'] === 2)?.['error']).toBeUndefined();
-        expect(second.stderr).not.toContain('agent-threat-rules');
+        // Named only as "not checked" (see the previous test); never as a failure or as running.
+        expect(second.stderr).not.toContain('ERR_MODULE_NOT_FOUND');
+        expect(second.stderr).not.toContain('metadata.atr');
     });
 
     it('explains itself and exits 2 when --advisory-rules is asked for explicitly', async () => {

@@ -349,6 +349,222 @@ export function sanitizeRenderedText(text: unknown, maxLength = 300): string {
     return flattened.length <= maxLength ? flattened : `${flattened.slice(0, maxLength)}...`;
 }
 
+/* ------------------------------------------------------------------ */
+/* `Rendered` — the type that makes "I forgot to sanitize this" a
+/* compile error.
+/* ------------------------------------------------------------------ */
+
+/**
+ * The brand. `declare const` so it exists only in the type system, and
+ * `unique symbol` so no other module can name it — which is the whole
+ * mechanism: the only way to obtain a `Rendered` is to call a function in this
+ * file, and every such function sanitizes.
+ *
+ * **Why it lives here and not in `src/audit/render.ts`, where it was born.**
+ * The brand was introduced as the structural fix for the *third* instance of
+ * one bug — attacker-controlled substrings reaching a surface a human reads to
+ * make a trust decision (round 2: `Finding.locus` in the `/dev/tty`
+ * confirmation dialog; round 3: raw tool names in pin-assessment headlines).
+ * It sat in `src/audit/` because that is a module every other module may
+ * import, and it therefore covered Dev 2's report types only. The two *proven*
+ * round-2 sinks — `guards/runtime/confirm.ts` and `transport/proxy.ts` — went
+ * on calling {@link sanitizeRenderedText} and {@link sanitizeLocus} by hand:
+ * discipline, not guarantee. Moving the brand beside the sanitizers it
+ * delegates to lets those sinks type their fields without any module having to
+ * depend on `src/audit/`. `src/audit/render.ts` was a re-export shim for one
+ * commit and is gone: once `assess.ts` imported the brand from here, nothing in
+ * the shipped path reached the shim and `wiring-completeness` correctly called
+ * it dead code. Embedders name the type through `toolwall` (`src/index.ts`) or
+ * `guards/metadata/index.ts`.
+ *
+ * There is deliberately **no second opinion about what is dangerous in a
+ * terminal**: {@link renderText} flattens with `sanitizeRenderedText` and
+ * {@link renderLocus} escapes with `sanitizeLocus`. A branded string is exactly
+ * "a string one of those two functions returned", never more.
+ */
+declare const RENDERED: unique symbol;
+
+/**
+ * Text that has been through a sanitizer and is safe to write to a terminal, a
+ * log line, a JSON-RPC error a client will surface, or any other place a human
+ * reads before making a trust decision.
+ *
+ * Assignable to `string` — every consumer that reads it as text is unaffected.
+ * `string` is **not** assignable to it, so a field declared `Rendered` cannot
+ * be filled with a plain template literal, and the mistake is a type error at
+ * the point it is made rather than a red-team finding two rounds later.
+ */
+export type Rendered = string & { readonly [RENDERED]: true };
+
+/** Default clip for an interpolated value, matching `sanitizeRenderedText`'s own default. */
+export const DEFAULT_RENDER_LENGTH = 300;
+
+/**
+ * Sanitize one value and brand it.
+ *
+ * Guarantees on the result, all inherited from {@link sanitizeRenderedText}:
+ *   - no C0/C1 control characters, so no ANSI escape can repaint the reader's
+ *     terminal and no newline can forge a row;
+ *   - no `U+2028`/`U+2029`, which are line terminators to some renderers and
+ *     not to others;
+ *   - no box-drawing characters, so untrusted text cannot draw the frame
+ *     around itself;
+ *   - all whitespace collapsed to single spaces;
+ *   - **at most `maxLength` characters, inclusive of any ellipsis.**
+ *     `sanitizeRenderedText` slices to its bound and then appends `"..."`, so
+ *     its result can exceed the number it was given by three. That is fine for
+ *     a dialog and wrong for a caller who asked for a hard bound, so the length
+ *     contract is enforced here. This adds no second opinion about which
+ *     characters are dangerous — that stays entirely in `sanitizeRenderedText`.
+ *
+ * Numbers, bigints and booleans pass through as their own decimal form: they
+ * cannot carry a control character, and routing them through a string
+ * sanitizer that returns `""` for non-strings would silently delete them from
+ * the sentence they were counted for. Everything else is stringified first, and
+ * `null`/`undefined` become `""`.
+ *
+ * **Idempotent.** Sanitizing already-`Rendered` text is a no-op, which is what
+ * lets a value be pre-clipped to a tighter bound and then interpolated into a
+ * template without being re-expanded or double-escaped.
+ */
+export function renderText(value: unknown, maxLength: number = DEFAULT_RENDER_LENGTH): Rendered {
+    if (typeof value === 'number' || typeof value === 'bigint' || typeof value === 'boolean') {
+        return String(value) as Rendered;
+    }
+    if (value === null || value === undefined) return '' as Rendered;
+    const text = typeof value === 'string' ? value : String(value);
+    const flat = sanitizeRenderedText(text, maxLength);
+    if (flat.length <= maxLength) return flat as Rendered;
+    return `${flat.slice(0, Math.max(0, maxLength - 3))}...` as Rendered;
+}
+
+/**
+ * Escape a `locus` for rendering, and brand it.
+ *
+ * A locus is a JSON Pointer into an attacker-controlled payload, so it gets the
+ * stricter treatment: {@link sanitizeLocus} percent-escapes everything outside
+ * `[A-Za-z0-9_-./~]`, which keeps it readable as a path while making it
+ * structurally incapable of adding a row or moving a cursor.
+ *
+ * This exists so a field typed `Rendered` can hold a locus **without a cast**.
+ * Before it, the only branded constructor flattened with `sanitizeRenderedText`,
+ * and a caller who wanted pointer-escaping had to either cast — defeating the
+ * type — or silently downgrade the locus to the weaker filter.
+ */
+export function renderLocus(locus: unknown): Rendered {
+    return sanitizeLocus(locus) as Rendered;
+}
+
+/**
+ * Compose a sentence from our own words and untrusted values, sanitizing every
+ * value.
+ *
+ * ```ts
+ * rendered`"${toolName}" is advertised ${count} times in one listing`
+ * ```
+ *
+ * The literal fragments come from `TemplateStringsArray`, which is source code
+ * and cannot be influenced by a server. The interpolations are not source code,
+ * and every one of them is passed through {@link renderText}. This is the only
+ * interpolation form that produces a `Rendered`, so a field typed `Rendered`
+ * cannot be filled with an unsanitized template literal — there is no version
+ * of this the author can get wrong, because there is no unsanitized path to
+ * write.
+ */
+export function rendered(strings: TemplateStringsArray, ...values: readonly unknown[]): Rendered {
+    return interpolate(DEFAULT_RENDER_LENGTH, strings, values);
+}
+
+/**
+ * {@link rendered}, with a different per-value clip.
+ *
+ * Only the *length* bound changes; the character filter is the same one, because there is only one
+ * opinion about what is dangerous in a terminal and it lives in {@link sanitizeRenderedText}.
+ *
+ * This exists because clipping is the one part of {@link renderText} that is not idempotent: a
+ * value pre-clipped to 400 and then interpolated by the default tag comes back at 300. A surface
+ * that has a wider row than the default — the `/dev/tty` dialog's `remediation`, which an operator
+ * has to be able to act on — states its own bound here rather than silently losing a quarter of
+ * the sentence to the composition step.
+ *
+ * ```ts
+ * const wide = renderedWithin(400);
+ * wide`│          ${finding.remediation}`;
+ * ```
+ */
+export function renderedWithin(
+    maxLength: number
+): (strings: TemplateStringsArray, ...values: readonly unknown[]) => Rendered {
+    return (strings, ...values) => interpolate(maxLength, strings, values);
+}
+
+/**
+ * Brand text that has been **checked** to satisfy the guarantee, rather than constructed to.
+ *
+ * The tags are the primary constructors and should be preferred everywhere. This exists for one
+ * shape they cannot express: a *renderer* whose job is layout — hard-wrapping a paragraph,
+ * indenting a continuation line, padding a column — over values that are already {@link Rendered}.
+ * The layout it adds is spaces and newlines chosen by source code, which the brand permits (see
+ * {@link renderLines}); what it cannot do is prove the values were `Rendered`, because by the time
+ * it holds a joined string the types are gone.
+ *
+ * So it checks. If anything in the result is a character no human-facing surface may carry, the
+ * assumption was wrong somewhere upstream and the text is flattened through
+ * {@link sanitizeRenderedText} instead — a report that loses its line breaks, not a terminal that
+ * loses its scrollback. **A fallback here means a bug upstream**, and the flattening is what keeps
+ * that bug from being exploitable while it is found.
+ *
+ * It is deliberately not exported as a general escape hatch dressed up as a check: it accepts only
+ * what the character class already forbids, so it can never launder an ANSI escape, a C1 control
+ * or a piece of frame. It can pass a newline — that is the whole point of it — which is why it
+ * belongs only in code whose newlines come from source.
+ */
+export function renderVerified(text: string): Rendered {
+    if (FORBIDDEN_RENDER_CHARS.test(text)) {
+        return sanitizeRenderedText(text, text.length) as Rendered;
+    }
+    return text as Rendered;
+}
+
+/**
+ * Join already-rendered lines into one rendered block.
+ *
+ * `Rendered` is a per-**fragment** guarantee, not a single-line one: `\n` is deliberately absent
+ * from {@link FORBIDDEN_RENDER_CHARS} because a dialog and a report are both multi-line and their
+ * own renderers write the separators. What the brand promises is that no *untrusted fragment*
+ * contributed a newline, a control character or a piece of frame — so a block assembled from
+ * `Rendered` lines by source code is itself `Rendered`, and this is the function that says so
+ * without a cast at the call site.
+ */
+export function renderLines(lines: readonly Rendered[]): Rendered {
+    return lines.join('\n') as Rendered;
+}
+
+function interpolate(maxLength: number, strings: TemplateStringsArray, values: readonly unknown[]): Rendered {
+    let out = strings[0] ?? '';
+    for (let i = 0; i < values.length; i++) {
+        out += renderText(values[i], maxLength);
+        out += strings[i + 1] ?? '';
+    }
+    return out as Rendered;
+}
+
+/**
+ * Characters that must never appear in anything a human is shown.
+ *
+ * Exported so the property can be asserted end-to-end on a whole rendered
+ * report or dialog rather than field by field — the type system prevents the
+ * mistake at construction, and this catches anything that reached the page by a
+ * route the types did not cover. Belt and braces, because the braces have now
+ * failed three times.
+ *
+ * `\n` and `\t` are absent on purpose: a *report* is multi-line, its own
+ * renderer writes those, and the guarantee is that no untrusted **fragment**
+ * can contribute one.
+ */
+export const FORBIDDEN_RENDER_CHARS =
+    /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u2028\u2029\u2500-\u257F]/u;
+
 /**
  * One thing a guard noticed. A `Finding` is evidence, not a decision — the
  * decision is the `Verdict`.

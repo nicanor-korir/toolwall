@@ -130,12 +130,13 @@ export {
 } from "./assess.js";
 /**
  * `Rendered` is part of the assessment's public shape — every text field on a `RiskSignal` is one —
- * so it is re-exported here for embedders. It lives in `src/audit/render.ts`; see that file for why
- * the brand exists and why its long-term home is beside `sanitizeRenderedText` in
- * `src/types/protocol.ts`.
+ * so it is re-exported here for embedders. It now lives beside `sanitizeRenderedText` in
+ * `src/types/protocol.ts`, which is what lets `guards/runtime/confirm.ts` and `transport/proxy.ts`
+ * — the two sinks red team round 2 proved — type their fields with the same brand. See that file,
+ * and decisions C-14a / C-30, for the history of why it exists.
  */
-export { FORBIDDEN_RENDER_CHARS, renderText, rendered } from "../../audit/render.js";
-export type { Rendered } from "../../audit/render.js";
+export { FORBIDDEN_RENDER_CHARS, renderLocus, renderText, rendered } from "../../types/protocol.js";
+export type { Rendered } from "../../types/protocol.js";
 
 export type {
   AssessOptions,

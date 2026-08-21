@@ -42,6 +42,8 @@
  *      finishes.
  */
 
+import type { Rendered } from "../../types/protocol.js";
+
 /** Characters that are invisible, direction-altering, or otherwise not faithfully rendered. */
 const INVISIBLE = new RegExp(
   "[" +
@@ -398,20 +400,29 @@ export function classifyChange(diff: FieldDiff): ChangeImpact {
 }
 
 export interface DriftAlertOptions {
-  /** e.g. `tool "send_email"` or `server instructions`. Goes in the headline. */
-  readonly subject: string;
+  /**
+   * e.g. `tool "send_email"` or `server instructions`. Goes in the headline.
+   *
+   * **`Rendered`, because a tool name is not ours.** The headline interpolates this into a
+   * sentence an operator reads before deciding whether their server was swapped, and a name
+   * carrying newlines forges rows in exactly the way red team round 3 proved on the pin-assessment
+   * sheet. The values *inside* the block are safe already — `escapeInvisible` turns every control
+   * character into `‹U+001B›` — but this one arrives from the caller, so the caller has to
+   * sanitize it and the type is what says so.
+   */
+  readonly subject: Rendered;
   readonly serverId: string;
   readonly pinnedHash: string;
   readonly liveHash: string;
   readonly diffs: readonly FieldDiff[];
   /** Authorization scope, when there is one. Shown only when it is not the default. */
-  readonly scope?: string;
+  readonly scope?: Rendered;
   /**
    * Scopes under which this exact live definition is ALREADY pinned. Non-empty turns the alert
    * from "your server may have been swapped" into "your credential changed", which is a different
    * decision and usually the right one.
    */
-  readonly alsoPinnedUnderScopes?: readonly string[];
+  readonly alsoPinnedUnderScopes?: readonly Rendered[];
   /** How many changes to show in full. Default 5. The rest are counted, not printed. */
   readonly maxFields?: number;
   readonly maxValueLength?: number;

@@ -347,16 +347,33 @@ export interface ArgumentShape {
   readonly maxObjectProperties: number;
   readonly maxDepth: number;
   readonly nodes: number;
+  /**
+   * **The walk stopped at the node cap and every number above is a LOWER BOUND** — contract C-29.
+   *
+   * The cap exists so measurement cannot itself be weaponized (T-08): an attacker must not be able
+   * to make the proxy walk an unbounded tree. But a bound that is invisible in the result is a
+   * fail-open, and it was one. `totalBytes` stopped accumulating at the cap, so
+   * `resultBoundsFindings` could not fire `maxTotalBytes` on precisely the payloads most likely to
+   * breach it, and {@link ScannedShape.protoKey} read `false` — indistinguishable from "checked and
+   * clean" — on a payload whose unvisited half may hold a `__proto__`. **A result too large to
+   * inspect was trusted more than a small one.**
+   *
+   * Surfacing it here is what lets a guard say "not inspected" instead of "clean". Both guards now
+   * treat `true` as a finding rather than as silence, which is the fail-safe direction: the number
+   * that is missing is missing *because* the payload is enormous.
+   */
+  readonly truncated: boolean;
 }
 
 /** {@link ArgumentShape} plus the `__proto__` verdict, from the same single traversal. */
 export interface ScannedShape extends ArgumentShape {
   /**
-   * `__proto__` appeared as an object key somewhere in the payload.
+   * `__proto__` appeared as an object key somewhere in the walked portion of the payload.
    *
-   * `false` when `scanProto` was not requested, and `false` rather than "unknown" when the node cap
-   * cut the walk short — the same fail-open bound the standalone `hasProtoKey` has always had, at
-   * four times the budget because it now shares `measure`'s 200k cap instead of its own 50k one.
+   * `false` when `scanProto` was not requested. **`false` also does not mean "clean" unless
+   * {@link ArgumentShape.truncated} is `false`** — read the two together. A `false` on a truncated
+   * walk means "not found in the part we could afford to look at", and the guards say exactly that
+   * rather than reporting a clean scan (C-29).
    */
   readonly protoKey: boolean;
 }
@@ -383,13 +400,20 @@ function walk(value: unknown, nodeCap: number, scanProto: boolean): ScannedShape
   let maxDepth = 0;
   let nodes = 0;
   let protoKey = false;
+  let truncated = false;
 
   const values: unknown[] = [value];
   const depths: number[] = [0];
   while (values.length > 0) {
     const v = values.pop();
     const d = depths.pop() as number;
-    if (++nodes > nodeCap) break;
+    if (++nodes > nodeCap) {
+      // C-29: the one place this walk gives up. Record it, because everything the caller reads
+      // from here on is a lower bound and a guard that cannot tell must not report a clean scan.
+      truncated = true;
+      nodes -= 1;
+      break;
+    }
     if (d > maxDepth) maxDepth = d;
 
     if (typeof v === "string") {
@@ -417,10 +441,16 @@ function walk(value: unknown, nodeCap: number, scanProto: boolean): ScannedShape
     }
   }
 
-  return { totalBytes, maxStringLength, maxArrayItems, maxObjectProperties, maxDepth, nodes, protoKey };
+  return { totalBytes, maxStringLength, maxArrayItems, maxObjectProperties, maxDepth, nodes, protoKey, truncated };
 }
 
-/** Single traversal; no serialization. Bounded so measurement itself cannot be weaponized. */
+/**
+ * Single traversal; no serialization. Bounded so measurement itself cannot be weaponized.
+ *
+ * **Read {@link ArgumentShape.truncated} before trusting any number this returns.** The bound is
+ * real and the walk really does stop; a caller that ignores the flag is reading lower bounds as if
+ * they were measurements, which is the fail-open C-29 recorded.
+ */
 export function measure(value: unknown, nodeCap = 200_000): ArgumentShape {
   return walk(value, nodeCap, false);
 }
@@ -432,6 +462,9 @@ export function measure(value: unknown, nodeCap = 200_000): ArgumentShape {
  * running `measure()` then `hasProtoKey()` walked the same bytes twice. On a 64 KiB result that
  * second walk is where the added-p99 headroom went — `docs/ARCHITECTURE.md` C-11 measured 4.348 ms
  * against a 5 ms budget and named this as the follow-up.
+ *
+ * `protoKey: false` on a shape whose `truncated` is `true` means "not found in the part that was
+ * walked", not "absent". `ResultGuard` blocks on `truncated` for exactly that reason.
  */
 export function measureAndScan(value: unknown, nodeCap = 200_000): ScannedShape {
   return walk(value, nodeCap, true);
@@ -455,7 +488,32 @@ function boundsFindings(shape: ArgumentShape, bounds: ArgumentBounds, toolName: 
   check(shape.maxArrayItems, bounds.maxArrayItems, "arrayItems", "Largest array argument", "Batch the call, or raise bounds.maxArrayItems for this tool.");
   check(shape.maxObjectProperties, bounds.maxObjectProperties, "objectProperties", "Widest object argument", "Raise bounds.maxObjectProperties for this tool if this shape is legitimate.");
   check(shape.maxDepth, bounds.maxDepth, "depth", "Argument nesting depth", "Raise bounds.maxDepth for this tool if this shape is legitimate. Deep nesting is also a proxy-DoS vector (T-08).");
+  if (shape.truncated) out.push(notFullyInspected(shape, "arguments", toolName));
   return out;
+}
+
+/**
+ * The finding a truncated walk produces — contract C-29, the fail-open that is now fail-safe.
+ *
+ * Deliberately NOT phrased as "this payload is too big": toolwall does not know that, and the
+ * bounds it *can* check may all be satisfied by the part it walked. What it knows is that it
+ * stopped, so it says that, and the severity reflects what the silence was hiding — every bound
+ * above is a lower bound and the `__proto__` scan covered part of the tree.
+ */
+export function notFullyInspected(shape: ArgumentShape, what: "arguments" | "result", subject: string | undefined): Finding {
+  const where = what === "arguments" ? "bounds" : "response.bounds";
+  return {
+    ruleId: what === "arguments" ? "toolwall/bounds.not-fully-inspected" : "toolwall/result.bounds.not-fully-inspected",
+    severity: "high",
+    locus: what === "arguments" ? "/arguments" : "",
+    message:
+      `Inspection stopped after ${shape.nodes} nodes, so this ${what === "arguments" ? "argument payload" : "result"} was only partially checked: ` +
+      `the size figures are lower bounds and the __proto__ scan covered only the part that was walked.`,
+    remediation:
+      `Send less in one message — a narrower query, a page, a smaller batch. The node cap is a fixed anti-DoS bound (T-08), not a policy knob, so raising ${where} will not make this payload inspectable. ` +
+      "A payload large enough to defeat inspection is refused rather than passed, because the alternative is trusting it more than a small one.",
+    evidence: { nodes: shape.nodes, partialBytes: shape.totalBytes, ...(subject !== undefined && subject !== "" ? { subject } : {}) },
+  };
 }
 
 /* ---------------------------------------------------------------- */

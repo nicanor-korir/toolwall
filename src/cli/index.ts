@@ -18,6 +18,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
+import { renderLines, renderLocus, renderText, rendered, renderedWithin, type Rendered } from '../types/protocol.js';
 import { parseArgs, USAGE, type ParsedArgs } from './args.js';
 import { assembleToolwall, type AtrOptions, type Toolwall } from '../index.js';
 import { AtrScanner } from '../guards/metadata/rules.js';
@@ -35,17 +36,79 @@ import { SpawnPolicyError, describeInheritedEnvironment, type SpawnSpec } from '
 import { StreamableHttpListener, type ListenerEvent } from '../transport/listener.js';
 import { totalBackoffMs } from '../transport/reconnect.js';
 import type { ProxyEvent } from '../transport/proxy.js';
+import type { PinEvent } from '../guards/metadata/drift.js';
 
 const VERSION = '0.0.0';
 
-function err(line: string): void {
+/**
+ * The operator's channel, and — like the `/dev/tty` dialog — a surface a human reads to decide
+ * whether to keep trusting a server. It is therefore typed `Rendered`.
+ *
+ * **This is the fourth site of the round-2 bug class, found by typing this parameter.** `err()`
+ * took a plain `string`, and `reportEvent` interpolated `finding.message` into it — the one field
+ * `redactFindingForClient` withholds from the client precisely because it quotes the untrusted
+ * server verbatim. On a live terminal that is worse than on the wire: an ANSI escape in a poisoned
+ * tool description does not merely display, it repaints, and the line it can scroll away is the
+ * `toolwall: BLOCKED` line printed immediately above it. The audit log keeps the raw bytes (a file
+ * read later, deliberately unsanitized — see `src/audit/log.ts`); the terminal does not.
+ */
+function err(line: Rendered): void {
     process.stderr.write(`${line}\n`);
 }
 
-/** Load `toolwall-policy.json`, or fall back to the tier preset with no policy file. */
-async function loadPolicy(opts: ParsedArgs): Promise<{ policy: ResolvedPolicy } | { error: string }> {
+/**
+ * A finding row on the operator's terminal.
+ *
+ * Wider than the module default because this is the channel that is *supposed* to carry the
+ * evidence: contract C-9 withholds `message` from the client precisely so the operator's stderr
+ * and the audit log can keep it, and a drift alert's field-level diff is the whole decision.
+ *
+ * It is still flattened to one line, and that is the security half. `message` quotes the untrusted
+ * server verbatim, so a newline inside it would let a poisoned description print its own
+ * `toolwall: ...` line under toolwall's own prefix. The bound is the clip, not the guarantee — the
+ * guarantee is that every row on this stream was opened by a static fragment of source code.
+ *
+ * **Known limit, stated rather than implied:** the child process's own stderr is relayed to this
+ * same terminal byte-for-byte (`onUpstreamTransport`), by design, so a server can still write
+ * whatever it likes *there*. What it cannot do, now, is put those bytes inside a line toolwall
+ * authored.
+ */
+const detail = renderedWithin(2000);
+
+/*
+ * A note for anyone editing the templates below: the tag sanitizes every interpolated value, and
+ * sanitizing TRIMS. A conditional fragment written as `${n === 1 ? ' was' : 's were'}` therefore
+ * loses its leading space and runs into the previous word. Put the space in the static text, where
+ * it is source code, and let the interpolation carry only the words.
+ */
+
+/**
+ * A multi-line diagnostic — a stack trace, a list of policy errors — with every LINE sanitized and
+ * the line structure kept.
+ *
+ * `renderText` collapses newlines, which is right for one dialog row and wrong for a stack trace an
+ * operator has to read. This splits first and sanitizes each line, so no untrusted fragment can
+ * contribute a control character while the shape a human needs survives. It adds no second opinion
+ * about what is dangerous: every line goes through the same `renderText`.
+ */
+function renderDiagnostic(text: unknown, maxLength = 300): Rendered {
+    return renderLines(
+        (text === null || text === undefined ? '' : String(text)).split('\n').map(l => renderText(l, maxLength))
+    );
+}
+
+/**
+ * Load `toolwall-policy.json`, or fall back to the tier preset with no policy file.
+ *
+ * `declaredServers` comes back with it because a policy file's server keys have to *match* the
+ * connected server's id to do anything, and nothing else in the pipeline is in a position to notice
+ * that they do not. See {@link warnOnUnmatchedPolicyServers}.
+ */
+async function loadPolicy(
+    opts: ParsedArgs
+): Promise<{ policy: ResolvedPolicy; declaredServers: readonly string[] } | { error: string }> {
     if (opts.policyFile === undefined) {
-        return { policy: defaultPolicy(opts.tier) };
+        return { policy: defaultPolicy(opts.tier), declaredServers: [] };
     }
     let raw: unknown;
     try {
@@ -59,9 +122,37 @@ async function loadPolicy(opts: ParsedArgs): Promise<{ policy: ResolvedPolicy } 
         return { error: `${opts.policyFile} is not a valid policy:\n${detail}` };
     }
     for (const warning of parsed.warnings) {
-        err(`toolwall: policy warning: ${warning}`);
+        err(rendered`toolwall: policy warning: ${warning}`);
     }
-    return { policy: parsed.policy };
+    const servers = (raw as { servers?: unknown }).servers;
+    const declaredServers =
+        typeof servers === 'object' && servers !== null && !Array.isArray(servers) ? Object.keys(servers) : [];
+    return { policy: parsed.policy, declaredServers };
+}
+
+/**
+ * A policy whose server keys match nothing enforces nothing, and used to say nothing.
+ *
+ * Server ids are derived — `srv_<32 hex>` over the command, args, cwd and env key names — so a
+ * hand-written policy that keys its servers as `"filesystem"` or `"git"` (which is what the shipped
+ * example does, and what anyone would write) matches the connected server **only** when the
+ * operator also passes `--server-id filesystem`. Without it every `servers[...]` block is inert:
+ * `grantFor` falls through to the tier defaults, no filesystem root is enforced, no egress
+ * allowlist is declared, and toolwall starts up looking exactly as it does when the policy is
+ * working. That is a silent no-op on the control the operator went to the trouble of writing.
+ *
+ * It cannot be an error — a policy legitimately describes several servers and only one of them is
+ * connected in this process — so it is a loud warning that names the id it actually derived, which
+ * is also the value they can paste into the file.
+ */
+function warnOnUnmatchedPolicyServers(declared: readonly string[], serverId: string, policyFile: string): void {
+    if (declared.length === 0 || declared.includes(serverId)) return;
+    err(
+        rendered`toolwall: WARNING ${policyFile} declares servers=[${declared.join(', ')}] and none of them is "${serverId}", the id derived for this connection. Every servers[...] block in that file is inert for this session: capability falls back to the tier defaults and any egress allowlist you wrote is not being enforced.`
+    );
+    err(
+        rendered`toolwall: fix it either way — re-run with --server-id ${declared[0] ?? 'name'} so the key matches, or key the policy on "${serverId}". The derived id covers command, args, cwd and inherited env NAMES, so it changes when any of those do.`
+    );
 }
 
 export async function main(argv: readonly string[]): Promise<number> {
@@ -72,10 +163,10 @@ export async function main(argv: readonly string[]): Promise<number> {
             err(USAGE);
             return 0;
         case 'version':
-            err(VERSION);
+            err(rendered`${VERSION}`);
             return 0;
         case 'error':
-            err(`toolwall: ${parsed.message}`);
+            err(rendered`toolwall: ${parsed.message}`);
             return 2;
         case 'run':
             break;
@@ -96,7 +187,8 @@ export async function main(argv: readonly string[]): Promise<number> {
 
     const loaded = await loadPolicy(opts);
     if ('error' in loaded) {
-        err(`toolwall: ${loaded.error}`);
+        // Multi-line: a policy parse failure lists one error per offending pointer.
+        err(rendered`toolwall: ${renderDiagnostic(loaded.error)}`);
         return 2;
     }
 
@@ -111,19 +203,19 @@ export async function main(argv: readonly string[]): Promise<number> {
         });
     } catch (error) {
         if (error instanceof PinStoreIntegrityError) {
-            err(`toolwall: ${error.message}`);
+            err(rendered`toolwall: ${renderDiagnostic(error.message)}`);
             return 4;
         }
         throw error;
     }
     for (const warning of pins.warnings) {
-        err(`toolwall: pin store warning: ${warning}`);
+        err(rendered`toolwall: pin store warning: ${warning}`);
     }
 
     const audit = new AuditLog({
         cwd: storeCwd,
         ...(opts.auditFile !== undefined ? { file: opts.auditFile } : {}),
-        onWriteError: error => err(`toolwall: audit write failed: ${error instanceof Error ? error.message : String(error)}`)
+        onWriteError: error => err(rendered`toolwall: audit write failed: ${error instanceof Error ? error.message : String(error)}`)
     });
 
     // The advisory detector, only when the operator named a lane. Loading it is slow (~780 YAML
@@ -136,11 +228,10 @@ export async function main(argv: readonly string[]): Promise<number> {
             const scanner = await AtrScanner.create({ lane: opts.advisoryRules });
             atr = { scanner, mode: 'advisory' };
             err(
-                `toolwall: advisory rules ON, lane=${opts.advisoryRules}, ${scanner.ruleCount} rules loaded. ` +
-                    'This detector NEVER blocks — matches go to stderr and the audit log only.'
+                rendered`toolwall: advisory rules ON, lane=${opts.advisoryRules}, ${scanner.ruleCount} rules loaded. This detector NEVER blocks — matches go to stderr and the audit log only.`
             );
         } catch (error) {
-            err(`toolwall: --advisory-rules could not start: ${error instanceof Error ? error.message : String(error)}`);
+            err(rendered`toolwall: --advisory-rules could not start: ${error instanceof Error ? error.message : String(error)}`);
             return 2;
         }
     }
@@ -166,19 +257,15 @@ export async function main(argv: readonly string[]): Promise<number> {
             try {
                 serverJson = JSON.parse(await readFile(opts.serverJsonFile, 'utf8'));
             } catch (error) {
-                err(`toolwall: could not read ${opts.serverJsonFile}: ${error instanceof Error ? error.message : String(error)}`);
+                err(rendered`toolwall: could not read ${opts.serverJsonFile}: ${error instanceof Error ? error.message : String(error)}`);
                 return 2;
             }
         }
         provenance = { ...parsedProvenance, ...(serverJson === undefined ? {} : { serverJson }) };
         err(
             provenance.network === NETWORK_ENABLED
-                ? `toolwall: provenance ON with registry lookups to ${provenance.registryUrl ?? 'https://registry.npmjs.org'}. ` +
-                      'This is the ONE thing in toolwall that makes a network request, it runs once at pin time, and it ' +
-                      'reports who published a package — never that its tools are honest.'
-                : 'toolwall: provenance ON, offline. The package is resolved and any server.json fileSha256 is hashed ' +
-                      'locally; the registry half reports "not checked", which is not the same as "clean". ' +
-                      'Add --verify-provenance to look it up.'
+                ? rendered`toolwall: provenance ON with registry lookups to ${provenance.registryUrl ?? 'https://registry.npmjs.org'}. This is the ONE thing in toolwall that makes a network request, it runs once at pin time, and it reports who published a package — never that its tools are honest.`
+                : rendered`toolwall: provenance ON, offline. The package is resolved and any server.json fileSha256 is hashed locally; the registry half reports "not checked", which is not the same as "clean". Add --verify-provenance to look it up.`
         );
     }
 
@@ -189,8 +276,7 @@ export async function main(argv: readonly string[]): Promise<number> {
     const channel = ttyChannel();
     if (channel === undefined) {
         err(
-            'toolwall: no controlling terminal, so nothing can ask you to confirm anything. ' +
-                'Every verdict that needs a human fails closed. This is normal when a client spawned toolwall.'
+            rendered`toolwall: no controlling terminal, so nothing can ask you to confirm anything. Every verdict that needs a human fails closed. This is normal when a client spawned toolwall.`
         );
     }
 
@@ -258,18 +344,34 @@ export async function main(argv: readonly string[]): Promise<number> {
                   ? {}
                   : { enable: { inference: false } }),
             ...(atr !== undefined ? { atr } : {}),
-            ...(provenance !== undefined ? { provenance, onProvenanceReport: report => err(`toolwall: ${describeProvenance(report)}`) } : {}),
+            ...(provenance !== undefined ? { provenance, onProvenanceReport: report => err(rendered`toolwall: ${describeProvenance(report)}`) } : {}),
             confirmationChannel: channel ?? null,
             onConfirmation: record =>
                 err(
-                    `toolwall: confirmation ${record.outcome} for ${record.rule ?? 'an unnamed rule'} ` +
-                        `on ${record.ctx.method} (${record.remaining} left this session)`
+                    rendered`toolwall: confirmation ${record.outcome} for ${record.rule ?? 'an unnamed rule'} on ${record.ctx.method} (${record.remaining} left this session)`
                 ),
-            onEvent: (event: ProxyEvent) => reportEvent(event, opts.verbose)
+            onEvent: (event: ProxyEvent) => reportEvent(event, opts.verbose),
+            /*
+             * The pin-time assessment, on the operator's channel, in the DEFAULT path.
+             *
+             * The sheet exists to be the evidence a human gets at the one moment they are asked to
+             * trust a server. Without this it reached a person only under `--pin-mode strict`,
+             * where it renders into the `toolwall/pin-unpinned` finding; under TOFU — the default —
+             * the audit record carried `event.message`, the one-line headline, and the sheet was
+             * computed and thrown away. A report nobody is shown is not a control.
+             *
+             * `assessment.rendered` is `Rendered`, so it goes out with its layout intact and
+             * without a second pass over text that is already sanitized field by field. stderr
+             * only: stdout is the protocol channel (C-3).
+             */
+            onPinEvent: (event: PinEvent) => {
+                if (event.assessment !== undefined) err(event.assessment.rendered);
+                else if (opts.verbose) err(rendered`toolwall: pin ${event.kind} ${event.pinKind} ${event.subject}`);
+            }
         });
     } catch (error) {
         if (error instanceof SpawnPolicyError) {
-            err(error.message);
+            err(renderDiagnostic(error.message));
             return 3;
         }
         throw error;
@@ -279,41 +381,43 @@ export async function main(argv: readonly string[]): Promise<number> {
     // Names only for the environment; values are never written anywhere.
     const env = describeInheritedEnvironment(spec);
     err(
-        `toolwall: spawning upstream serverId=${toolwall.serverId} command=${JSON.stringify(toolwall.spawnAudit.command)} args=${JSON.stringify(toolwall.spawnAudit.args)} cwd=${JSON.stringify(toolwall.spawnAudit.cwd)} env=[${env.effective.join(',')}]`
+        rendered`toolwall: spawning upstream serverId=${toolwall.serverId} command=${JSON.stringify(toolwall.spawnAudit.command)} args=${JSON.stringify(toolwall.spawnAudit.args)} cwd=${JSON.stringify(toolwall.spawnAudit.cwd)} env=[${env.effective.join(',')}]`
     );
     for (const warning of toolwall.spawnAudit.warnings) {
-        err(`toolwall: warning [${warning.ruleId}] ${warning.message}`);
+        err(rendered`toolwall: warning [${warning.ruleId}] ${warning.message}`);
     }
 
     if (opts.noGuards) {
-        err('toolwall: --no-guards is set. Every control is OFF; this is a bare passthrough and defends nothing.');
+        err(rendered`toolwall: --no-guards is set. Every control is OFF; this is a bare passthrough and defends nothing.`);
     } else {
         err(
-            `toolwall: guards=[${toolwall.registeredGuards.join(',')}] tier=${loaded.policy.tier} pin-mode=${opts.pinMode} on-unverifiable=${opts.onUnverifiable} pins=${pins.path} (${pins.size} pinned) confirm-budget=${loaded.policy.confirmation.maxPrompts}${channel === undefined ? ' (no tty: confirm fails closed)' : ''}`
+            rendered`toolwall: guards=[${toolwall.registeredGuards.join(',')}] tier=${loaded.policy.tier} pin-mode=${opts.pinMode} on-unverifiable=${opts.onUnverifiable} pins=${pins.path} (${pins.size} pinned) confirm-budget=${loaded.policy.confirmation.maxPrompts} ${channel === undefined ? '(no tty: confirm fails closed)' : ''}`
         );
         // Separate from the guards line on purpose: inference is not a guard, it is the policy the
         // capability and schema guards enforce. A banner that lied about which of the two was on
         // would be worse than no banner, so it names the one thing that decides day-zero coverage.
         err(
             opts.inference
-                ? `toolwall: inference=on roots=[${storeCwd}] observation=off — each tool's capability is derived from its ` +
-                      'PINNED inputSchema, and an explicit declaration in --policy always wins. --no-inference turns this off.'
-                : 'toolwall: inference=off. The capability layer now enforces only what your policy file declares; ' +
-                      `with no policy file that is nothing.${opts.policyFile === undefined ? ' You have no policy file.' : ''}`
+                ? rendered`toolwall: inference=on roots=[${storeCwd}] observation=off — each tool's capability is derived from its PINNED inputSchema, and an explicit declaration in --policy always wins. --no-inference turns this off.`
+                : rendered`toolwall: inference=off. The capability layer now enforces only what your policy file declares; with no policy file that is nothing. ${opts.policyFile === undefined ? 'You have no policy file.' : ''}`
         );
     }
+    if (opts.policyFile !== undefined) {
+        warnOnUnmatchedPolicyServers(loaded.declaredServers, toolwall.serverId, opts.policyFile);
+    }
+
     const reconnect = toolwall.proxy.reconnectPolicy;
     err(
         reconnect.enabled
-            ? `toolwall: reconnect=on attempts=${reconnect.maxAttempts} over ~${totalBackoffMs(reconnect)}ms buffer<=${reconnect.maxBufferedRequests} replay-in-flight=${reconnect.replayInFlight} reverify=${reconnect.reverifyOnReconnect}`
-            : 'toolwall: reconnect=off; an upstream blip ends the client session.'
+            ? rendered`toolwall: reconnect=on attempts=${reconnect.maxAttempts} over ~${totalBackoffMs(reconnect)}ms buffer<=${reconnect.maxBufferedRequests} replay-in-flight=${reconnect.replayInFlight} reverify=${reconnect.reverifyOnReconnect}`
+            : rendered`toolwall: reconnect=off; an upstream blip ends the client session.`
     );
     if (opts.verbose) {
-        err(`toolwall: env inherited from SDK defaults: [${env.sdkDefaults.join(',')}]`);
-        err(`toolwall: env explicitly passed through: [${env.passthrough.join(',')}]`);
-        err('toolwall: the full process environment is NOT forwarded to the child.');
+        err(rendered`toolwall: env inherited from SDK defaults: [${env.sdkDefaults.join(',')}]`);
+        err(rendered`toolwall: env explicitly passed through: [${env.passthrough.join(',')}]`);
+        err(rendered`toolwall: the full process environment is NOT forwarded to the child.`);
         if (audit.path !== undefined) {
-            err(`toolwall: audit log: ${audit.path}`);
+            err(rendered`toolwall: audit log: ${audit.path}`);
         }
     }
 
@@ -332,7 +436,7 @@ export async function main(argv: readonly string[]): Promise<number> {
     try {
         await toolwall.start();
     } catch (error) {
-        err(`toolwall: failed to start: ${error instanceof Error ? error.message : String(error)}`);
+        err(rendered`toolwall: failed to start: ${renderDiagnostic(error instanceof Error ? error.message : String(error))}`);
         await toolwall.close();
         return 1;
     }
@@ -342,26 +446,21 @@ export async function main(argv: readonly string[]): Promise<number> {
         // default asks the OS for one. The token is printed exactly here and nowhere else: it is
         // never written to the audit log, the pin store or any file.
         err(
-            `toolwall: listening on ${listener.url} era=${listener.era} ` +
-                `(${listener.profile.allowedMethods.join('/')}${listener.profile.usesSessions ? ', sessions' : ', no sessions'}` +
-                `${listener.profile.supportsResumability ? ', resumable' : ', no resumability'})`
+            rendered`toolwall: listening on ${listener.url} era=${listener.era} (${listener.profile.allowedMethods.join('/')}${listener.profile.usesSessions ? ', sessions' : ', no sessions'}${listener.profile.supportsResumability ? ', resumable' : ', no resumability'})`
         );
-        err(`toolwall: bearer token for this session: ${listener.token}`);
+        err(rendered`toolwall: bearer token for this session: ${listener.token}`);
         err(
-            'toolwall: every request needs `Authorization: Bearer <token>`, and Origin/Host are validated ' +
-                '(403 on mismatch). There is no way to turn either off — see --help under HTTP.'
+            rendered`toolwall: every request needs \`Authorization: Bearer <token>\`, and Origin/Host are validated (403 on mismatch). There is no way to turn either off — see --help under HTTP.`
         );
         if (listener.boundBeyondLoopback) {
             err(
-                `toolwall: WARNING this listener is bound to ${opts.listen?.host ?? '?'}, which is NOT loopback. ` +
-                    'Anything that can route to this machine can now reach the MCP server toolwall is proxying, ' +
-                    'protected only by the bearer token. Bind 127.0.0.1 unless you have a reason not to.'
+                rendered`toolwall: WARNING this listener is bound to ${opts.listen?.host ?? '?'}, which is NOT loopback. Anything that can route to this machine can now reach the MCP server toolwall is proxying, protected only by the bearer token. Bind 127.0.0.1 unless you have a reason not to.`
             );
         }
     }
 
     if (opts.verbose) {
-        err(`toolwall: proxying (era=${toolwall.era}, pid=${toolwall.upstreamTransport.pid ?? 'unknown'})`);
+        err(rendered`toolwall: proxying (era=${toolwall.era}, pid=${toolwall.upstreamTransport.pid ?? 'unknown'})`);
     }
 
     // Stay alive until one of the two legs closes; `ToolwallProxy` tears the
@@ -418,12 +517,12 @@ async function persist(toolwall: Toolwall): Promise<void> {
             await toolwall.pins.flush();
         }
     } catch (error) {
-        err(`toolwall: could not write the pin store: ${error instanceof Error ? error.message : String(error)}`);
+        err(rendered`toolwall: could not write the pin store: ${error instanceof Error ? error.message : String(error)}`);
     }
     try {
         await toolwall.audit.flush();
     } catch (error) {
-        err(`toolwall: could not write the audit log: ${error instanceof Error ? error.message : String(error)}`);
+        err(rendered`toolwall: could not write the audit log: ${error instanceof Error ? error.message : String(error)}`);
     }
 }
 
@@ -437,11 +536,11 @@ function reportListenerEvent(event: ListenerEvent, verbose: boolean): void {
             // is the operator's business whether or not they asked for verbosity. The rejected
             // BODY is never printed — it is attacker-shaped input.
             if (event.status === 401 || event.status === 403 || verbose) {
-                err(`toolwall: HTTP ${event.status} ${event.method} ${event.path} [${event.ruleId}] ${event.message}`);
+                err(rendered`toolwall: HTTP ${event.status} ${event.method} ${event.path} [${event.ruleId}] ${event.message}`);
             }
             break;
         case 'listener-error':
-            err(`toolwall: listener error: ${event.error.message}`);
+            err(rendered`toolwall: listener error: ${event.error.message}`);
             break;
         default: {
             const exhaustive: never = event;
@@ -453,65 +552,61 @@ function reportListenerEvent(event: ListenerEvent, verbose: boolean): void {
 function reportEvent(event: ProxyEvent, verbose: boolean): void {
     switch (event.kind) {
         case 'blocked':
-            err(`toolwall: BLOCKED ${event.ctx.direction} ${event.ctx.method} code=${event.code}`);
+            err(rendered`toolwall: BLOCKED ${event.ctx.direction} ${event.ctx.method} code=${event.code}`);
             for (const f of event.findings) {
-                err(`toolwall:   [${f.severity}] ${f.ruleId} at ${f.locus || '<payload>'}: ${f.message}`);
-                err(`toolwall:   -> ${f.remediation}`);
+                err(detail`toolwall:   [${f.severity}] ${f.ruleId} at ${renderLocus(f.locus) || '<payload>'}: ${f.message}`);
+                err(detail`toolwall:   -> ${f.remediation}`);
             }
             break;
         case 'annotated':
         case 'findings':
             for (const f of event.findings) {
-                err(`toolwall: [${f.severity}] ${f.ruleId} on ${event.ctx.direction} ${event.ctx.method} at ${f.locus || '<payload>'}: ${f.message}`);
+                err(detail`toolwall: [${f.severity}] ${f.ruleId} on ${event.ctx.direction} ${event.ctx.method} at ${renderLocus(f.locus) || '<payload>'}: ${f.message}`);
             }
             break;
         case 'upstream-error':
             if (verbose) {
-                err(`toolwall: upstream error: ${event.error.message}`);
+                err(rendered`toolwall: upstream error: ${event.error.message}`);
             }
             break;
         case 'client-error':
             if (verbose) {
-                err(`toolwall: client error: ${event.error.message}`);
+                err(rendered`toolwall: client error: ${event.error.message}`);
             }
             break;
         case 'upstream-closed':
             if (verbose) {
-                err('toolwall: upstream connection closed');
+                err(rendered`toolwall: upstream connection closed`);
             }
             break;
         case 'client-closed':
             if (verbose) {
-                err('toolwall: client connection closed');
+                err(rendered`toolwall: client connection closed`);
             }
             break;
         case 'upstream-reconnecting':
             err(
-                `toolwall: upstream connection lost; reconnect attempt ${event.attempt}/${event.maxAttempts}, ` +
-                    `${event.buffered} request${event.buffered === 1 ? '' : 's'} buffered`
+                rendered`toolwall: upstream connection lost; reconnect attempt ${event.attempt}/${event.maxAttempts}, ${event.buffered} request${event.buffered === 1 ? '' : 's'} buffered`
             );
             break;
         case 'upstream-reconnected':
             err(
-                `toolwall: upstream reconnected after ${event.downtimeMs}ms on attempt ${event.attempt}; ` +
-                    `re-verified against the pin store, releasing ${event.released} buffered request${event.released === 1 ? '' : 's'}`
+                rendered`toolwall: upstream reconnected after ${event.downtimeMs}ms on attempt ${event.attempt}; re-verified against the pin store, releasing ${event.released} buffered request${event.released === 1 ? '' : 's'}`
             );
             break;
         case 'upstream-reconnect-refused':
             // Loud unconditionally. This is the rug pull arriving through a restart.
             err(
-                'toolwall: REFUSED to resume. The upstream MCP server restarted and no longer matches what was approved, ' +
-                    `so ${event.buffered} buffered request${event.buffered === 1 ? ' was' : 's were'} failed rather than released.`
+                rendered`toolwall: REFUSED to resume. The upstream MCP server restarted and no longer matches what was approved, so ${event.buffered} buffered request${event.buffered === 1 ? '' : 's'} ${event.buffered === 1 ? 'was' : 'were'} failed rather than released.`
             );
             for (const f of event.findings) {
-                err(`toolwall:   [${f.severity}] ${f.ruleId} at ${f.locus || '<payload>'}: ${f.message}`);
-                err(`toolwall:   -> ${f.remediation}`);
+                err(detail`toolwall:   [${f.severity}] ${f.ruleId} at ${renderLocus(f.locus) || '<payload>'}: ${f.message}`);
+                err(detail`toolwall:   -> ${f.remediation}`);
             }
             break;
         case 'upstream-reconnect-failed':
             err(
-                `toolwall: upstream unreachable after ${event.attempts} attempts (${event.error.message}); ` +
-                    `${event.buffered} buffered request${event.buffered === 1 ? '' : 's'} answered with -32603`
+                rendered`toolwall: upstream unreachable after ${event.attempts} attempts (${event.error.message}); ${event.buffered} buffered request${event.buffered === 1 ? '' : 's'} answered with -32603`
             );
             break;
         default: {
@@ -529,7 +624,7 @@ if (invokedDirectly) {
             process.exitCode = code;
         })
         .catch((error: unknown) => {
-            err(`toolwall: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
+            err(rendered`toolwall: ${renderDiagnostic(error instanceof Error ? (error.stack ?? error.message) : String(error), 2000)}`);
             process.exitCode = 1;
         });
 }

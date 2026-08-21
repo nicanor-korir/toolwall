@@ -13,7 +13,7 @@ import {
 import { scanRequestedSchema } from "../../policy/credentials.js";
 import type { ResolvedPolicy } from "../../policy/parse.js";
 import type { ArgumentBounds, ResponsePolicy } from "../../policy/schema.js";
-import { measureAndScan } from "./capability-guard.js";
+import { measureAndScan, notFullyInspected, type ScannedShape } from "./capability-guard.js";
 import { SchemaValidator } from "./json-schema.js";
 import { extractToolCall } from "./schema-guard.js";
 
@@ -814,7 +814,16 @@ function collectText(result: Record<string, unknown>): string {
   return parts.join("\n");
 }
 
-/** `__proto__` as an object key, anywhere in the payload. Bounded traversal. */
+/**
+ * `__proto__` as an object key, anywhere in the payload. Bounded traversal.
+ *
+ * **Fails open at the cap and cannot do otherwise** — it returns a `boolean`, so "I stopped
+ * looking" and "it is not there" are the same value. Nothing in the shipped request path calls it:
+ * `#onResult` uses {@link measureAndScan}, whose `ScannedShape` carries `truncated` alongside
+ * `protoKey` so the guard can tell those two apart (contract C-29). This stays exported for
+ * embedders who want the standalone check and is safe only on a payload they already know is
+ * small.
+ */
 export function hasProtoKey(value: unknown, maxNodes = 50_000): boolean {
   let nodes = 0;
   const stack: unknown[] = [value];
@@ -836,7 +845,7 @@ export function hasProtoKey(value: unknown, maxNodes = 50_000): boolean {
 }
 
 function resultBoundsFindings(
-  shape: { totalBytes: number; maxStringLength: number; maxArrayItems: number; maxObjectProperties: number; maxDepth: number },
+  shape: ScannedShape,
   bounds: ArgumentBounds,
   method: string,
   toolName: string | undefined,
@@ -858,5 +867,15 @@ function resultBoundsFindings(
   check(shape.maxArrayItems, bounds.maxArrayItems, "maxArrayItems", "Largest array");
   check(shape.maxObjectProperties, bounds.maxObjectProperties, "maxObjectProperties", "Widest object");
   check(shape.maxDepth, bounds.maxDepth, "maxDepth", "Nesting depth");
+  /*
+   * C-29 · the cap fails SAFE now.
+   *
+   * Every `check` above compares a number the walk stopped accumulating at the node cap, so on a
+   * truncated payload they are all satisfiable by construction — the bigger the result, the less
+   * of it any bound could see. That made a result too large to inspect the safest-looking result
+   * on the wire. It is now a finding of its own, and it blocks, which is the same answer the
+   * bounds themselves give to a payload they can measure.
+   */
+  if (shape.truncated) out.push(notFullyInspected(shape, "result", toolName));
   return out;
 }

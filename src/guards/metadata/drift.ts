@@ -81,7 +81,7 @@ import type { PinDecision, PinRecord, PinScope, PinStore } from "../../audit/man
 import { DEFAULT_PIN_SCOPE } from "../../audit/manifest.js";
 import type { ProvenanceReport } from "../../audit/provenance.js";
 import type { Finding, Guard, GuardContext, ProtocolEra, Verdict } from "../../types/protocol.js";
-import { ALLOW, TOOLWALL_BLOCKED } from "../../types/protocol.js";
+import { ALLOW, TOOLWALL_BLOCKED, renderText, rendered, type Rendered } from "../../types/protocol.js";
 
 /** Methods whose *response* carries a server's pinned surface, by era. */
 const SERVER_DESCRIPTOR_METHODS: Readonly<Record<ProtocolEra, string>> = {
@@ -1076,8 +1076,12 @@ export class MetadataPinGuard implements Guard {
    * without the block delivering the payload to the model it was protecting.
    */
   #driftFinding(report: DriftReport, locus: string): Finding {
-    const what =
-      report.pinKind === "server" ? "server instructions" : `tool "${report.subject}"`;
+    // `report.subject` is the tool NAME, which the untrusted server chose. It used to be
+    // interpolated raw into the alert headline an operator reads before deciding whether their
+    // server was swapped — the same shape as the round-3 pin-assessment finding, on the drift
+    // surface. The tag sanitizes it; the static words around it are source code.
+    const what: Rendered =
+      report.pinKind === "server" ? rendered`server instructions` : rendered`tool "${report.subject}"`;
     const invisible = report.diffs.some((d) => d.invisibleOnly === true);
     const scopeChange = report.alsoPinnedUnderScopes.length > 0;
 
@@ -1087,8 +1091,11 @@ export class MetadataPinGuard implements Guard {
       pinnedHash: report.pinnedHash,
       liveHash: report.liveHash,
       diffs: report.diffs,
-      scope: report.scope,
-      alsoPinnedUnderScopes: report.alsoPinnedUnderScopes,
+      // A scope is derived from the credential the listing was fetched with, and a
+      // `alsoPinnedUnderScopes` entry is one of those read back from the pin file. Neither is a
+      // string toolwall wrote, so both are rendered rather than trusted.
+      scope: renderText(report.scope, 120),
+      alsoPinnedUnderScopes: report.alsoPinnedUnderScopes.map(sc => renderText(sc, 120)),
     });
 
     return finding({

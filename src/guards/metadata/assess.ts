@@ -87,7 +87,7 @@
  * work over a payload the canonicalizer has already walked. It never runs on `tools/call`.
  */
 import { DEFAULT_HAZARD_POLICY, decodeTagBlock, scanSurface, type SurfaceHazard } from "./unicode.js";
-import { rendered, renderText, type Rendered } from "../../audit/render.js";
+import { renderLines, renderText, renderVerified, rendered, type Rendered } from "../../types/protocol.js";
 import type { ProvenanceReport } from "../../audit/provenance.js";
 import type { Finding } from "../../types/protocol.js";
 
@@ -305,7 +305,7 @@ export interface PinRiskAssessment {
   /** What the bounds cost, stated even when the answer is nothing. See {@link Truncation}. */
   readonly truncated: Truncation;
   /** The report a human reads. Invisible-character-safe; quotes untrusted text only through `renderVisible`. */
-  readonly rendered: string;
+  readonly rendered: Rendered;
   /** One line, for an audit record or an event message. */
   readonly headline: string;
 }
@@ -1022,7 +1022,7 @@ rendered`${n} tool names are each advertised more than once in one listing`,
   };
   // `rendered` is derived from everything else, so it is filled in last and `renderPinAssessment`
   // never reads it. Exposed as a separate function so an embedder can re-render a stored report.
-  const withHeadline = { ...core, headline: renderHeadline(core), rendered: "" };
+  const withHeadline = { ...core, headline: renderHeadline(core), rendered: renderText("") };
   return { ...withHeadline, rendered: renderPinAssessment(withHeadline) };
 }
 
@@ -1373,16 +1373,27 @@ function renderHeadline(a: Omit<PinRiskAssessment, "rendered" | "headline">): st
  * make the decision, and it is unconditional: it prints on a clean listing exactly as it prints on
  * a filthy one.
  */
-export function renderPinAssessment(a: PinRiskAssessment): string {
-  const lines: string[] = [];
+export function renderPinAssessment(a: PinRiskAssessment): Rendered {
+  /*
+   * `Rendered[]`, not `string[]`.
+   *
+   * Every value interpolated below is already `Rendered` by type — that is what the fields on
+   * `RiskSignal`, `Measurement` and `NotChecked` are for. What this function adds is LAYOUT:
+   * indentation, column padding, hard wrapping, blank lines. `renderVerified` is the brand for
+   * exactly that shape: it re-checks the assembled line against the forbidden class rather than
+   * trusting the assembly, so a field that somehow arrived unsanitized flattens the report instead
+   * of repainting the reader's terminal. Pure-literal lines use the `rendered` tag, whose static
+   * fragments are source code.
+   */
+  const lines: Rendered[] = [];
   // `serverId` is derived from the operator's own launch config rather than from the wire, but
   // it is the one field on this page that is not already `Rendered`, and "not from the wire" is
   // exactly the reasoning that failed in Rounds 2 and 3.
-  lines.push(`PIN-TIME ASSESSMENT · ${renderText(a.serverId, 120)}`);
+  lines.push(rendered`PIN-TIME ASSESSMENT · ${a.serverId}`);
   lines.push(
-    `${a.toolCount} tool${a.toolCount === 1 ? "" : "s"} · assessed ${a.assessedAt} · offline, no network, nothing sent anywhere`,
+    rendered`${a.toolCount} tool${a.toolCount === 1 ? "" : "s"} · assessed ${a.assessedAt} · offline, no network, nothing sent anywhere`,
   );
-  lines.push("");
+  lines.push(rendered``);
 
   /*
    * The truncation notice goes ABOVE the signals, not below them.
@@ -1392,75 +1403,77 @@ export function renderPinAssessment(a: PinRiskAssessment): string {
    * forty junk lines and no notice that the line worth acting on had been dropped.
    */
   if (a.truncated.droppedSignals > 0 || a.truncated.unscannedTextUnits > 0) {
-    lines.push("!! THIS REPORT IS INCOMPLETE");
+    lines.push(rendered`!! THIS REPORT IS INCOMPLETE`);
     if (a.truncated.droppedSignals > 0) {
       lines.push(
-        rendered`   ${a.truncated.droppedSignals} signal${a.truncated.droppedSignals === 1 ? " was" : "s were"} not shown: ${a.truncated.droppedRules.join(", ")}`,
+        rendered`   ${a.truncated.droppedSignals} signal${a.truncated.droppedSignals === 1 ? "" : "s"} ${a.truncated.droppedSignals === 1 ? "was" : "were"} not shown: ${a.truncated.droppedRules.join(", ")}`,
       );
     }
     if (a.truncated.unscannedTextUnits > 0) {
       lines.push(
-        `   ${a.truncated.unscannedTextUnits} text fields were never scanned — the listing exceeded the work budget.`,
+        rendered`   ${a.truncated.unscannedTextUnits} text fields were never scanned — the listing exceeded the work budget.`,
       );
     }
     lines.push(
-      `   ${wrap(renderText("Do not read the sections below as the whole picture. Raise the bound and re-run, or review the definition by hand."), 3)}`,
+      renderVerified(
+        `   ${wrap(renderText("Do not read the sections below as the whole picture. Raise the bound and re-run, or review the definition by hand."), 3)}`,
+      ),
     );
-    lines.push("");
+    lines.push(rendered``);
   }
 
   if (a.signals.length === 0) {
-    lines.push("No signals raised. That means the checks below found nothing — not that there is");
-    lines.push("nothing to find. See the closing note.");
-    lines.push("");
+    lines.push(rendered`No signals raised. That means the checks below found nothing — not that there is`);
+    lines.push(rendered`nothing to find. See the closing note.`);
+    lines.push(rendered``);
   }
 
   for (const lane of LANE_ORDER) {
     const inLane = a.signals.filter((s) => s.lane === lane);
     if (inLane.length === 0) continue;
-    lines.push(LANE_TITLE[lane]);
+    lines.push(renderVerified(LANE_TITLE[lane]));
     for (const s of inLane) {
-      lines.push(`  · ${s.headline}`);
+      lines.push(renderVerified(`  · ${s.headline}`));
       // A grouped signal has to show its subjects or the count is unactionable: "45 duplicated
       // names" tells a reader what happened, "45 duplicated names: helper_0, helper_1, …" tells
       // them where to look.
       if (s.subjects.length > 0) {
         const more = s.omittedSubjects > 0 ? ` and ${s.omittedSubjects} more` : "";
-        lines.push(`      ${wrap(rendered`tools: ${s.subjects.join(", ")}${more}`, 6)}`);
+        lines.push(renderVerified(`      ${wrap(rendered`tools: ${s.subjects.join(", ")}${more}`, 6)}`));
       } else if (s.occurrences > 1) {
-        lines.push(`      ${s.occurrences} occurrences`);
+        lines.push(rendered`      ${s.occurrences} occurrences`);
       }
       for (const example of s.examples) {
-        if (example.locus.length > 0) lines.push(`      at ${example.locus}`);
-        if (example.detail.length > 0) lines.push(`      "${example.detail}"`);
+        if (example.locus.length > 0) lines.push(renderVerified(`      at ${example.locus}`));
+        if (example.detail.length > 0) lines.push(renderVerified(`      "${example.detail}"`));
       }
       if (s.occurrences > s.examples.length) {
-        lines.push(`      … and ${s.occurrences - s.examples.length} more like it`);
+        lines.push(rendered`      … and ${s.occurrences - s.examples.length} more like it`);
       }
-      lines.push(`      ${wrap(s.confidence, 6)}`);
+      lines.push(renderVerified(`      ${wrap(s.confidence, 6)}`));
     }
-    lines.push("");
+    lines.push(rendered``);
   }
 
-  lines.push("Measurements (context, not findings)");
+  lines.push(rendered`Measurements (context, not findings)`);
   for (const meas of a.measurements) {
     const mark = meas.outsideReference ? " ← outside the observed benign range" : "";
-    lines.push(`  ${String(meas.value).padStart(6)} ${meas.unit.padEnd(6)} ${meas.label}${mark}`);
-    if (meas.reference !== undefined) lines.push(`         benign: ${meas.reference}`);
+    lines.push(renderVerified(`  ${String(meas.value).padStart(6)} ${meas.unit.padEnd(6)} ${meas.label}${mark}`));
+    if (meas.reference !== undefined) lines.push(renderVerified(`         benign: ${meas.reference}`));
   }
-  lines.push("");
+  lines.push(rendered``);
 
   if (a.notChecked.length > 0) {
-    lines.push("Not checked — say so out loud rather than let silence read as a pass");
+    lines.push(rendered`Not checked — say so out loud rather than let silence read as a pass`);
     for (const n of a.notChecked) {
-      lines.push(`  · ${n.what}: ${wrap(n.why, 4)}`);
-      if (n.toEnable !== undefined) lines.push(`      enable with: ${n.toEnable}`);
+      lines.push(renderVerified(`  · ${n.what}: ${wrap(n.why, 4)}`));
+      if (n.toEnable !== undefined) lines.push(renderVerified(`      enable with: ${n.toEnable}`));
     }
-    lines.push("");
+    lines.push(rendered``);
   }
 
   lines.push(wrap(PIN_ASSESSMENT_CAVEAT, 0));
-  return lines.join("\n");
+  return renderLines(lines);
 }
 
 /**
@@ -1471,7 +1484,7 @@ export function renderPinAssessment(a: PinRiskAssessment): string {
  * input, the fourth instance of this bug class is a type error at the call site rather than a line
  * an attacker writes into someone's approval screen.
  */
-function wrap(text: Rendered, indent: number): string {
+function wrap(text: Rendered, indent: number): Rendered {
   const width = 92 - indent;
   const pad = " ".repeat(indent);
   const words = text.split(/\s+/u);
@@ -1486,7 +1499,9 @@ function wrap(text: Rendered, indent: number): string {
     }
   }
   if (line.length > 0) out.push(line);
-  return out.join(`\n${pad}`);
+  // Input is `Rendered`; everything added is a newline and spaces chosen here. `renderVerified`
+  // re-checks that rather than asserting it — see its doc for why the layout case needs one.
+  return renderVerified(out.join(`\n${pad}`));
 }
 
 /**

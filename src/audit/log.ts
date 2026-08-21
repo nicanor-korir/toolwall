@@ -48,7 +48,19 @@ import type { AuditSink } from "../policy/contract.js";
 import type { Finding, GuardContext, GuardDirection } from "../types/protocol.js";
 
 export const AUDIT_FILE_FORMAT = "toolwall/audit";
-export const DEFAULT_AUDIT_FILE = ".toolwall/audit.jsonl";
+
+/*
+ * There is deliberately no DEFAULT_AUDIT_FILE.
+ *
+ * One used to sit here — `".toolwall/audit.jsonl"` — and nothing read it: the CLI writes a file
+ * only when `--audit-log <file>` names one, and `docs/configuration.md` documents the default as
+ * "none (in-memory)". A constant that looks like a default but is not one is a trap for the next
+ * reader, who wires it up believing they are restoring intended behaviour and quietly changes what
+ * every session writes to disk. The default is in-memory on purpose: the audit log keeps the
+ * untrusted server's text verbatim (that is its job — the operator wants the bytes), and a
+ * security proxy that starts writing that into the working directory of whatever spawned it,
+ * unasked, is making a decision that belongs to the operator. Name the file and it is written.
+ */
 
 export type AuditRecordKind =
   /** Non-blocking findings from a guard that returned `allow` — the C-2 records. */

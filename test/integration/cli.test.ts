@@ -15,7 +15,7 @@
  */
 import { execFile } from 'node:child_process';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -206,8 +206,49 @@ describe('the documented invocation, run verbatim', () => {
         // of the two postures they are in, because it is what decides day-zero coverage.
         expect(session.stderr()).toContain('toolwall: inference=on');
         expect(session.stderr()).toContain('observation=off');
-        // T-09 is off and unmentioned: nothing was asked for, so nothing was constructed.
-        expect(session.stderr()).not.toContain('provenance');
+        // T-09 is off: nothing was asked for, so nothing was constructed and no banner claims it.
+        expect(session.stderr()).not.toContain('toolwall: provenance ON');
+        // It is still NAMED, under the pin sheet's "Not checked" heading. That is the sheet's whole
+        // discipline — silence reads as a pass — and it is the opposite of claiming coverage. The
+        // sheet reaches stderr in the DEFAULT path now; before that it existed only under
+        // `--pin-mode strict`, which meant the evidence sheet reached nobody on the common path.
+        expect(session.stderr()).toContain('PIN-TIME ASSESSMENT');
+        expect(session.stderr()).toContain('Not checked — say so out loud rather than let silence read as a pass');
+    });
+
+    it('says so loudly when a policy file keys its servers on something this connection is not', async () => {
+        /*
+         * The shipped example keys its servers `"filesystem"` / `"git"`, because `srv_9f3c…` is not
+         * something a human maintains. Server ids are derived, so those keys match only under
+         * `--server-id`, and a policy whose keys match nothing enforces nothing — quietly. That is
+         * a silent no-op on the one control the operator hand-wrote, so it now names the derived id
+         * and the fix.
+         */
+        dir = await mkdtemp(path.join(tmpdir(), 'toolwall-cli-srvid-'));
+        const policyFile = path.join(dir, 'toolwall-policy.json');
+        await writeFile(
+            policyFile,
+            JSON.stringify({
+                version: 1,
+                tier: 'balanced',
+                servers: { filesystem: { egress: { hosts: ['api.example.com'], schemes: ['https'] } } }
+            })
+        );
+
+        const unmatched = startCli(['--server', `node ${BENIGN}`, '--policy', policyFile], dir);
+        sessions.push(unmatched);
+        await unmatched.request('initialize', INIT);
+        expect(unmatched.stderr()).toContain('declares servers=[filesystem] and none of them is "srv_');
+        expect(unmatched.stderr()).toContain('--server-id filesystem');
+
+        // And with the key matched, no warning at all.
+        const matched = startCli(
+            ['--server', `node ${BENIGN}`, '--policy', policyFile, '--server-id', 'filesystem'],
+            dir
+        );
+        sessions.push(matched);
+        await matched.request('initialize', INIT);
+        expect(matched.stderr()).not.toContain('declares servers=');
     });
 
     it('accepts the Week-3 flags verbatim, and provenance stays offline without --verify-provenance', async () => {

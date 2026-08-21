@@ -61,7 +61,7 @@ import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/proto
 import { z } from 'zod';
 
 import type { Finding, GuardContext, GuardDirection, MessageCorrelation, ProtocolEra } from '../types/protocol.js';
-import { DEFAULT_PROTOCOL_ERA, TOOLWALL_INTERNAL_ERROR, sanitizeLocus, sanitizeRenderedText } from '../types/protocol.js';
+import { DEFAULT_PROTOCOL_ERA, TOOLWALL_INTERNAL_ERROR, renderLocus, renderText, type Rendered } from '../types/protocol.js';
 import type { GuardPipeline } from './pipeline.js';
 import { DefaultGuardPipeline } from './pipeline.js';
 import {
@@ -183,25 +183,41 @@ export class RelayedRpcError extends Error {
  * is not, and neither is sanitized there — an operator reading a log wants the bytes.
  */
 export interface RedactedFinding {
-    readonly ruleId: string;
+    /**
+     * Every text field is `Rendered` — a branded string obtainable only from a sanitizer in
+     * `src/types/protocol.ts`. The fields were already sanitized here; typing them makes it
+     * impossible to *stop* sanitizing them, which is the difference between the round-2 fix and a
+     * guarantee. A future field added to this interface as `string` is a decision someone has to
+     * make deliberately; one added as `Rendered` cannot be filled from a raw `Finding`.
+     */
+    readonly ruleId: Rendered;
+    /**
+     * Deliberately NOT `Rendered`: it is a closed union of five literals that toolwall defines, and
+     * branding it would erase the union for every client that switches on it. A guard that emits a
+     * severity outside the union is a type error at its own call site. It is still flattened before
+     * it reaches a *terminal* (see `promptRow` in `guards/runtime/confirm.ts`), because a composed
+     * third-party rule pack is JavaScript at runtime.
+     */
     readonly severity: Finding['severity'];
-    readonly locus: string;
-    readonly remediation: string;
-    readonly detail: string;
+    readonly locus: Rendered;
+    readonly remediation: Rendered;
+    readonly detail: Rendered;
 }
 
-const DETAIL_WITHHELD =
+const DETAIL_WITHHELD = renderText(
     "withheld from the client: it quotes the untrusted server's own text. The full finding, " +
-    "including the field-level diff, is on toolwall's stderr and in the audit log.";
+        "including the field-level diff, is on toolwall's stderr and in the audit log.",
+    600
+);
 
 export function redactFindingForClient(finding: Finding): RedactedFinding {
     return {
         // `ruleId` is namespaced by owner and composed rule packs supply their own, so it is not
         // ours either. One line, no control characters, like everything else here.
-        ruleId: sanitizeRenderedText(finding.ruleId, 120),
+        ruleId: renderText(finding.ruleId, 120),
         severity: finding.severity,
-        locus: sanitizeLocus(finding.locus),
-        remediation: sanitizeRenderedText(finding.remediation, 600),
+        locus: renderLocus(finding.locus),
+        remediation: renderText(finding.remediation, 600),
         detail: DETAIL_WITHHELD
     };
 }

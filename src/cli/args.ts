@@ -7,7 +7,7 @@ import type { AtrLane } from '../guards/metadata/rules.js';
 import type { StrictnessTier } from '../policy/schema.js';
 import { DEFAULT_LISTEN_HOST, splitAuthority } from '../transport/http.js';
 import type { ReplayPolicy } from '../transport/reconnect.js';
-import { isProtocolEra, type ProtocolEra } from '../types/protocol.js';
+import { isProtocolEra, rendered, type ProtocolEra } from '../types/protocol.js';
 
 export type PinMode = 'tofu' | 'strict';
 export type UnverifiableDisposition = 'block' | 'confirm' | 'allow';
@@ -59,8 +59,8 @@ export interface ParsedArgs {
      * Inferred capability policy. **On by default**; `--no-inference` turns it off.
      *
      * Measured (`test/unit/infer.test.ts`, `test/unit/fp-harness.test.ts`): at zero configuration
-     * it catches 15/17 capability-abuse calls against 0/17 without it, for 0.0% false positives on
-     * the 59-case benign corpus — the same 0.0% the no-inference baseline scores. Off, the
+     * it catches 16/17 capability-abuse calls (94.1%) against 0/17 without it, for 0.0% false
+     * positives on the 63-case benign corpus — the same 0.0% the no-inference baseline scores. Off, the
      * capability layer enforces exactly what a policy file declares, which at day zero is nothing.
      */
     readonly inference: boolean;
@@ -114,7 +114,12 @@ export type ParseResult =
     | { readonly kind: 'version' }
     | { readonly kind: 'error'; readonly message: string };
 
-export const USAGE = `toolwall — local-first MCP guardrail proxy
+/**
+ * `--help`. Tagged `rendered` so it is typed `Rendered`, which is what the CLI's stderr writer
+ * accepts — every fragment here is source code, there are no interpolations, and the tag passes
+ * static fragments through verbatim, so the column alignment survives untouched.
+ */
+export const USAGE = rendered`toolwall — local-first MCP guardrail proxy
 
 USAGE
   toolwall --server "<command> [args...]" [options]
@@ -128,17 +133,29 @@ REQUIRED
 OPTIONS
   --cwd <dir>             Working directory for the child process.
   --allow-command <name>  Restrict the spawnable binary to this basename.
-                          Repeatable. Omit for no binary allowlist — argument
-                          level validation still applies either way.
+                          Repeatable. Omit for no binary allowlist — validation
+                          of the server command's own arguments still applies
+                          either way. None of the three flags in this group
+                          inspect TOOL arguments; that is the capability layer,
+                          under GUARDS below.
   --pass-env <NAME>       Copy NAME from toolwall's environment into the child.
                           Repeatable. Nothing beyond the SDK's default set is
                           passed otherwise; run with --verbose to see exactly
                           what the child inherits.
   --era <revision>        Protocol era: 2025-11-25 (default) or 2026-07-28.
   --server-id <id>        Override the derived per-connection server identity.
-  --allow-inline-code     Permit sh -c / node -e / npx -c style invocation.
-                          This disables the primary T-07 control. Do not.
-  --allow-privilege-pivot Permit sudo / docker / ssh / env as the command.
+  --allow-inline-code     Applies to the SERVER COMMAND you pass in --server,
+                          not to tool arguments. Permits an interpreter to be
+                          launched with an inline-code flag: sh -c, node -e,
+                          python -c, powershell -EncodedCommand and the rest.
+                          This is the documented bypass for --allow-command and
+                          disables the primary T-07 control. Do not.
+  --allow-privilege-pivot Also applies to the SERVER COMMAND, not to tool
+                          arguments. Permits sudo / su / doas / env / ssh /
+                          docker / kubectl / xargs and similar as the command
+                          itself — binaries whose whole job is to run some
+                          OTHER program, which makes a binary allowlist
+                          meaningless.
   -v, --verbose           Diagnostics on stderr. Never on stdout: under stdio
                           transport stdout is the protocol channel.
   -h, --help              This text.
@@ -164,9 +181,9 @@ GUARDS
                           and network capability from its own PINNED inputSchema,
                           so a calculator needs no hand-written rule saying it
                           may not read ~/.ssh/id_rsa. Measured on this repo's
-                          corpora: 15/17 capability-abuse calls caught with no
-                          policy file, against 0/17 without it, at 0.0% false
-                          positives on the 59-case benign corpus — the same
+                          corpora: 16/17 capability-abuse calls caught (94.1%)
+                          with no policy file, against 0/17 without it, at 0.0%
+                          false positives on the 63-case benign corpus — the same
                           0.0% the no-inference baseline scores. An explicit
                           declaration in --policy always wins per capability.
                           Turning this off means the capability layer enforces

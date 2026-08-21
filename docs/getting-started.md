@@ -421,6 +421,9 @@ needs a terminal for the same reason.
 
 - [configuration.md](./configuration.md) — every flag, the policy file format, the strictness tiers
   and what inference derives.
-- `toolwall-policy.example.json` in the repo root — a working policy file to copy.
+- `toolwall-policy.example.json` in the repo root — a working policy file to copy. It keys its
+  servers readably (`filesystem`, `git`), so run it with `--server-id filesystem`; server ids are
+  otherwise derived as `srv_<32 hex>` and a key that matches nothing enforces nothing. toolwall
+  warns on stderr when that happens and prints the id it derived.
 - [threat-model.md](./threat-model.md) — what each control is for, and what it deliberately does not
   cover.

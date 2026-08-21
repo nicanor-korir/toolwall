@@ -896,6 +896,28 @@ the tree. The node cap stays a fixed anti-DoS bound, not a policy knob — raisi
 make an uninspectable payload inspectable. Read `truncated` before trusting any number the shape
 returns.
 
+**The false-positive cost of a cap that now flags things, measured before shipping it.**
+A control that starts blocking has to be run against legitimate traffic first, or the fix is worse
+than the fail-open. `test/integration/node-cap-c29.test.ts` walks the whole benign corpus — every
+result, every sequence step, every benign call's arguments, 118 payloads — and reports the headroom:
+
+```
+C-29 node-cap headroom: 118 benign payloads, largest is "result:result.sql-rows-conforming"
+at 1505 nodes against a cap of 200000 — 133x headroom. Truncated: 0.
+```
+
+The FP harnesses are unchanged by the fix: day-zero `permissive`/`balanced` stay at **0.0%** on the
+63-case request corpus, and the response leg stays at **0.0% / 0.0% / 4.2%** across the three tiers,
+the single `strict` block still being the pre-existing `outputSchema` one. The test asserts two
+orders of magnitude of headroom rather than eyeballing the log, so a future fixture that approaches
+the cap fails loudly instead of quietly re-opening the argument.
+
+**The coupling worth knowing about.** The `permissive` response preset allows `maxArrayItems:
+200_000`, which is the node cap itself, so a policy-legal payload at that ceiling would be refused
+as uninspectable. Nothing in the corpus or the benchmark comes within two orders of magnitude of it
+(`huge` is 48 007 nodes), so it is a documented edge rather than a measured cost — but it is the
+reason the remediation names "send less" and not "raise the bound".
+
 **2. `Buffer.byteLength` is ~34% of the walk, and is avoidable.** Measured on the `wide` payload
 (12 007 nodes, 217 749 bytes), 3 000 iterations after 300 warmup:
 
@@ -924,3 +946,109 @@ payload. `JSON.stringify` of the 219 KiB `wide` result is 0.33 ms p50 / 0.65 ms 
 cost of 3.48 ms mean, so forwarding the original bytes would recover under 10% of the layer it
 targets while requiring the transport to retain every raw frame. Not worth the coupling. Recorded
 so it is not re-proposed as an obvious win.
+
+### C-30
+**The `Rendered` brand moved to `types/protocol.ts`, and typing one more surface found two more
+unsanitized paths.**
+Status: **resolved**
+
+C-14a (round 2) and the round-3 pin-assessment follow-up are the same bug twice: an
+attacker-controlled substring reaching a surface a human reads to make a trust decision. The brand
+was the structural answer, but it lived in `src/audit/render.ts`, so it covered the report types and
+nothing else — `guards/runtime/confirm.ts` and `transport/proxy.ts`, the two sinks round 2 actually
+*proved*, went on calling `sanitizeRenderedText` / `sanitizeLocus` by hand. Discipline, not
+guarantee, and one forgetful edit from a fourth finding.
+
+**What moved.** `Rendered`, `renderText`, `rendered` and `FORBIDDEN_RENDER_CHARS` now live beside
+the sanitizers they delegate to in `src/types/protocol.ts`, which every module already depends on.
+Three constructors were added, all of them delegating and none of them a second opinion about what
+is dangerous in a terminal:
+
+| constructor | for | delegates to |
+|---|---|---|
+| `renderLocus(locus)` | a JSON Pointer, kept readable as a path | `sanitizeLocus` |
+| `renderedWithin(n)` | a surface with a wider row than the 300-char default | `renderText(v, n)` |
+| `renderLines(lines)` | assembling a multi-line block from rendered lines | — (join only) |
+
+`src/audit/render.ts` was **deleted** rather than left as a re-export shim: once `assess.ts` imported
+the brand from its new home the shim had no importer in the shipped path, and
+`test/integration/wiring-completeness.test.ts` correctly called it dead. Its manifest entry — which
+already said the brand "should eventually move next to the sanitizer in protocol.ts" — is gone with
+it. Consumers import from `toolwall` (`src/index.ts` re-exports `Rendered` alongside
+`PinRiskAssessment` and the rest of the assessment API) or from `guards/metadata/index.ts`.
+
+**What the compiler found.** Typing the two proven sinks produced **zero** errors — they were
+already correct, which is the point: they had the discipline. The errors came from typing the
+surface nobody had typed, the CLI's `err()`:
+
+| step | errors | genuine unsanitized paths | mechanical |
+|---|---|---|---|
+| move the brand, type `RedactedFinding` (`proxy.ts`) | 0 | 0 | 0 |
+| type the dialog's rows (`confirm.ts`) | 0 | 0 | 0 |
+| **type `err(line: Rendered)` (`cli/index.ts`)** | **51** | **1**, at three call sites | 50 |
+| type `DriftAlertOptions.subject` / `.scope` (`diff.ts`) | 3 | 1 (`scope` hardened with it) | 2 |
+| type `renderPinAssessment(): Rendered` (`assess.ts`) | 29 | 0 | 29 |
+| **total** | **83** | **2** | 81 |
+
+Fifty of the fifty-one are toolwall's own banner text and its own numbers — mechanical, and worth
+the noise only because the fifty-first was hiding in it. The two genuine ones:
+
+1. **`reportEvent` wrote `finding.message` straight to the operator's terminal.** That is the one
+   field `redactFindingForClient` withholds from the client *precisely because it quotes the
+   untrusted server verbatim*, and on a live TTY an ANSI escape does not display, it repaints — the
+   line it can scroll away being the `toolwall: BLOCKED` line printed immediately above it. Fixed:
+   finding rows go through a `renderedWithin(2000)` tag, wide enough to keep the field-level diff
+   C-9 deliberately routes here, flattened to one line so a newline in a message cannot open a
+   forged `toolwall: ...` line.
+2. **The drift alert headline interpolated the raw tool name.** `#driftFinding` built
+   `` `tool "${report.subject}"` `` — a server-chosen name — into the sentence an operator reads
+   before deciding whether their server was swapped. The same shape as the round-3 finding, on the
+   drift surface, reaching both stderr and the audit log. Fixed at the source: `DriftAlertOptions`
+   now types `subject`, `scope` and `alsoPinnedUnderScopes` as `Rendered`, so the compiler makes the
+   caller sanitize.
+
+**One more path closed without a proven exploit, recorded as such.** `reportListenerEvent` printed
+the HTTP listener's `method`, `path` and `message` raw, and `path` is `req.url` — bytes an attacker
+who can reach the port chose. Node's request-line parser already rejects control characters, so
+this is a plausible path rather than a demonstrated one; it goes through the tag now because
+"the parser upstream of us happens to reject that today" is the same reasoning that failed twice.
+
+**The honest limit of the stderr guarantee.** The CLI relays the child process's own stderr to the
+operator's terminal byte-for-byte and always has (`onUpstreamTransport`), deliberately, so that a
+server's diagnostics survive a reconnect. A server can therefore still write arbitrary bytes to that
+terminal. What it cannot do any more is put them *inside a line toolwall authored*. That distinction
+is the whole claim, and it is the same one the dialog makes.
+
+**One brand is verified rather than constructed, and that is a finding.** `renderVerified(text)` in
+`types/protocol.ts` brands a string **only if** it contains no character in
+`FORBIDDEN_RENDER_CHARS`, and flattens it through `sanitizeRenderedText` otherwise. It exists for
+one shape the tags cannot express: a renderer whose job is *layout* — hard-wrapping a paragraph,
+indenting a continuation, padding a column — over values that are already `Rendered`. By the time
+such a function holds a joined string the types are gone, so it re-checks instead of asserting.
+`renderPinAssessment` and its `wrap()` helper are its only users.
+
+It is weaker than construction in exactly one way, stated so nobody has to rediscover it: the
+character class deliberately excludes `\n` (a report is multi-line), so `renderVerified` cannot
+catch a *forged line* — only a forged frame or an escape sequence. It is sound there only because
+every value the pin sheet interpolates is `Rendered` by type and therefore already newline-free.
+**It belongs only in code whose newlines come from source**, and a hit on its fallback path means a
+bug upstream. This is the one place the migration did not get a compile-time guarantee, and it is
+recorded here rather than smoothed over.
+
+**Two product defects fixed alongside it, both found by a documentation pass:**
+
+- **The pin-time assessment reached nobody on the default path.** The sheet exists to be the
+  evidence a human gets at the one moment they are asked to trust a server, and the CLI passed no
+  `onPinEvent` — so under TOFU the audit record carried the one-line headline and the sheet was
+  computed and thrown away; only `--pin-mode strict` rendered it, into the `toolwall/pin-unpinned`
+  finding. It now goes to stderr in the default path. This is the reason
+  `renderPinAssessment` had to return `Rendered` at all: printing it through a re-sanitizer would
+  have collapsed the layout that makes it readable.
+- **A policy file whose server keys match nothing enforced nothing, silently.** Server ids are
+  derived (`srv_<32 hex>`), so the shipped `toolwall-policy.example.json` — keyed `"filesystem"` and
+  `"git"`, because `srv_9f3c…` is not a thing a human maintains — matches only under `--server-id`.
+  Without it every `servers[...]` block is inert: capability falls back to tier defaults and any
+  egress allowlist goes unenforced, while startup looks exactly as it does when the policy is
+  working. The CLI now warns loudly, names the id it derived, and gives both fixes; the docs show
+  the `--server-id` invocation. A warning rather than an error, because one policy file legitimately
+  describes several servers and only one is connected per session.
