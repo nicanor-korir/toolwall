@@ -3,11 +3,21 @@
 It sits between your LLM client and untrusted MCP servers and constrains what a tool can actually do —
 then proves the tool is still the one you approved, before every call.</p>
 <p align="center">
-  <img src="docs/assets/demo.svg" alt="toolwall blocking a rug pull: a server mutates its own tool description after approval, and the call is blocked with a field-level diff" width="100%">
+  <img src="https://raw.githubusercontent.com/nicanor-korir/toolwall/main/docs/assets/demo.gif" alt="toolwall blocking a rug pull" width="900">
 </p>
 <p align="center"><em>Real output from the shipped binary. No configuration was written.</em></p>
 
 ---
+
+## Install
+
+```bash
+npm i -g toolwall
+toolwall --server "npx -y @modelcontextprotocol/server-filesystem ~/work"
+```
+
+Then point your MCP client at `toolwall` instead of the server directly.
+See **[Getting started](https://github.com/nicanor-korir/toolwall/blob/main/docs/getting-started.md)** for Claude Desktop and Cursor config.
 
 ## What it does
 
@@ -22,35 +32,19 @@ catches a rug pull.
 **Stays out of the way.** No account, no telemetry, no network calls in the default path. Benign
 traffic is forwarded untouched, by reference, with no re-serialization.
 
-```mermaid
-flowchart LR
-    C["LLM client<br/>Claude Desktop · Cursor"] -->|JSON-RPC| T
-    subgraph T["toolwall"]
-      direction TB
-      P["pin · verify integrity"] --> S["schema · enforce the pinned contract"]
-      S --> K["capability · filesystem, egress, mutation"]
-      K --> R["result · injection, ATPA, MRTR"]
-    end
-    T -->|"forwarded, or blocked"| M["MCP server<br/>untrusted"]
-    T -.-> A["audit log<br/>hash-chained"]
 ```
-
-## Quickstart
-
-```bash
-git clone https://github.com/nicanor-korir/toolwall && cd toolwall
-npm install && npm run build
-
-# put toolwall in front of any MCP server
-node dist/cli/index.js --server "npx -y @modelcontextprotocol/server-filesystem ~/work"
+  LLM client                    toolwall                     MCP server
+  Claude Desktop  ──JSON-RPC──▶  pin      verify integrity  ──▶  untrusted
+  Cursor                         schema   enforce the pinned contract
+                                 capability  filesystem · egress · mutation
+                                 result   injection · ATPA · MRTR
+                                    │
+                                    └──▶ audit log (hash-chained)
 ```
-
-Then point your client at `toolwall` instead of the server directly — see
-**[Getting started](docs/getting-started.md)** for Claude Desktop and Cursor config.
 
 ## Measured
 
-Numbers are produced by the test suite, not estimated. Reproduce with `npm test`.
+Produced by the test suite, not estimated. Reproduce with `npm test`.
 
 | | Result |
 |---|---|
@@ -69,28 +63,28 @@ Stated plainly, because a security tool that implies more than it delivers is wo
   Run [Docker MCP Gateway](https://github.com/docker/mcp-gateway) alongside for containment.
 - **Trust-on-first-use pins whatever it first sees.** If a server is already malicious the first time
   you connect, toolwall pins the poison and enforces it faithfully. The
-  [pin-time assessment](docs/guards.md) is evidence for that decision, not a guarantee.
+  [pin-time assessment](https://github.com/nicanor-korir/toolwall/blob/main/docs/guards.md) is evidence for that decision, not a guarantee.
 - **It does not fix vulnerable servers.** Command injection and broken auth inside MCP servers are
   ~65% of catalogued MCP CVEs and are not addressable from a proxy.
 - **Heuristics are signals, not walls.** The phrase-matching approach this project started with detects
   **0 of 5** canonical published payloads — which is why it ships none. See
-  [design history](docs/design-history.md).
+  [design history](https://github.com/nicanor-korir/toolwall/blob/main/docs/design-history.md).
 
 ## Documentation
 
 | | |
 |---|---|
-| [Getting started](docs/getting-started.md) | Install, first run, wiring Claude Desktop and Cursor |
-| [How it works](docs/how-it-works.md) | The request path, guard pipeline, reconnect gate |
-| [Guards](docs/guards.md) | Every guard: what it catches, what it misses, measured rates |
-| [Configuration](docs/configuration.md) | Full flag reference, policy format, strictness tiers |
-| [Threat model](docs/threat-model.md) | What is defended, what is explicitly out of scope |
-| [Architecture](docs/architecture.md) | Module map, core interfaces, protocol eras |
-| [Decisions](docs/decisions.md) | The contract register — every rule and why it exists |
-| [Performance](docs/performance.md) | The measurement story and the budget |
-| [Positioning](docs/positioning.md) | Why capability leads and pinning is the substrate |
-| [Research brief](docs/research-brief.md) | Verified findings on the MCP security landscape |
-| [Design history](docs/design-history.md) | What changed from the original plan, and why |
+| [Getting started](https://github.com/nicanor-korir/toolwall/blob/main/docs/getting-started.md) | Install, first run, wiring Claude Desktop and Cursor |
+| [How it works](https://github.com/nicanor-korir/toolwall/blob/main/docs/how-it-works.md) | The request path, guard pipeline, reconnect gate |
+| [Guards](https://github.com/nicanor-korir/toolwall/blob/main/docs/guards.md) | Every guard: what it catches, what it misses, measured rates |
+| [Configuration](https://github.com/nicanor-korir/toolwall/blob/main/docs/configuration.md) | Full flag reference, policy format, strictness tiers |
+| [Threat model](https://github.com/nicanor-korir/toolwall/blob/main/docs/threat-model.md) | What is defended, what is explicitly out of scope |
+| [Architecture](https://github.com/nicanor-korir/toolwall/blob/main/docs/architecture.md) | Module map, core interfaces, protocol eras |
+| [Decisions](https://github.com/nicanor-korir/toolwall/blob/main/docs/decisions.md) | The contract register — every rule and why it exists |
+| [Performance](https://github.com/nicanor-korir/toolwall/blob/main/docs/performance.md) | The measurement story and the budget |
+| [Positioning](https://github.com/nicanor-korir/toolwall/blob/main/docs/positioning.md) | Why capability leads and pinning is the substrate |
+| [Research brief](https://github.com/nicanor-korir/toolwall/blob/main/docs/research-brief.md) | Verified findings on the MCP security landscape |
+| [Design history](https://github.com/nicanor-korir/toolwall/blob/main/docs/design-history.md) | What changed from the original plan, and why |
 
 ## Prior art
 
@@ -104,4 +98,4 @@ mutates after three tool calls specifically to walk through that gap.
 
 ## License
 
-MIT
+MIT · [Repository](https://github.com/nicanor-korir/toolwall) · [Issues](https://github.com/nicanor-korir/toolwall/issues)
